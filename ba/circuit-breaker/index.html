@@ -118,16 +118,23 @@ function onStart(mode, mount) {
   let gap, pad, bx0, by0, dotR;
   function layout() {
     // number of columns of "cells" across = W-1 ; we want dots to fill nicely
-    const size = Math.min(460, window.innerWidth - 34);
+    // Board is ~square, so also fit it to the viewport HEIGHT (minus room for the
+    // top bar, status, pills, legend & hint) so the bottom red row is never cut off.
+    const size = Math.max(250, Math.min(460, window.innerWidth - 34, window.innerHeight - 300));
     // blue dots span W across and H down; add half a cell margin for red overhang
     const cols = W;            // blue columns
     const rows = H;            // blue rows
     pad = 26;
     gap = Math.floor((size - pad * 2) / (cols - 1));
     dotR = Math.max(8, Math.min(13, Math.floor(gap * 0.16)));
-    bx0 = pad; by0 = pad;
+    // Red's lattice has H+1 rows: one ABOVE blue row 0 and one BELOW blue row H-1
+    // (red rows sit at by0 + (r-0.5)*gap for r = 0..H). Shift the blue grid down a
+    // half-cell and add a full cell of height so those top/bottom red rows are inside
+    // the viewBox instead of being clipped. Result: blue spans full width (left↔right),
+    // red spans full height (top↕bottom) — a proper, symmetric Bridg-it board.
+    bx0 = pad; by0 = pad + gap * 0.5;
     const wpx = pad * 2 + gap * (cols - 1);
-    const hpx = pad * 2 + gap * (rows - 1);
+    const hpx = pad * 2 + gap * rows;
     svg.setAttribute('viewBox', `0 0 ${wpx} ${hpx}`);
     svg.style.width = wpx + 'px';
   }
