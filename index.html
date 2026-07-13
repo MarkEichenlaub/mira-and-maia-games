@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mira &amp; Maia's Game Arcade 🎪</title>
+<link rel="stylesheet" href="assets/common.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E🎪%3C/text%3E%3C/svg%3E">
+<style>
+  .hero { text-align:center; padding:26px 16px 6px; position:relative; z-index:1; }
+  .hero h1 { font-size:clamp(30px,7vw,58px); margin:6px 0; line-height:1.02;
+             background:linear-gradient(90deg,#ff5a5f,#ff9f1c,#2ec4b6,#3a86ff,#8338ec);
+             -webkit-background-clip:text; background-clip:text; color:transparent; filter:drop-shadow(0 3px 0 #ffffff88); }
+  .hero p { font-size:clamp(15px,2.6vw,20px); color:var(--ink-soft); font-weight:700; margin:2px 0 0; }
+  .search-wrap { display:flex; justify-content:center; margin:16px 0 6px; }
+  .search { font-family:var(--font); font-weight:700; font-size:18px; border:4px solid #fff; border-radius:999px;
+            padding:12px 22px; width:min(460px,92vw); box-shadow:var(--shadow-lg); outline:none; }
+  .legend { display:flex; gap:8px; flex-wrap:wrap; justify-content:center; margin:10px auto 4px; }
+  .legend .lg { background:#fff; border-radius:999px; padding:5px 12px; font-weight:800; font-size:13px; box-shadow:0 3px 0 #e7e0d0; }
+  .section { max-width:1080px; margin:26px auto 0; padding:0 16px; position:relative; z-index:1; }
+  .section-head { display:flex; align-items:center; gap:12px; margin:8px 0 4px; }
+  .section-head .st { font-size:clamp(22px,4vw,32px); font-weight:800; }
+  .section-head .em { font-size:1.3em; }
+  .section-blurb { color:var(--ink-soft); font-weight:600; margin:0 0 8px; }
+  .group-name { font-weight:800; font-size:19px; margin:18px 0 8px; color:var(--ink); display:flex; gap:8px; align-items:center; }
+  .grid { display:grid; gap:14px; grid-template-columns:repeat(auto-fill, minmax(200px,1fr)); }
+  .tile { display:flex; flex-direction:column; text-decoration:none; color:var(--ink); background:#fff;
+          border-radius:var(--radius); border:4px solid #fff; box-shadow:var(--shadow-lg); overflow:hidden;
+          transition:transform .12s ease; min-height:150px; }
+  .tile:hover { transform:translateY(-6px) rotate(-.6deg); }
+  .tile:active { transform:translateY(-1px); }
+  .tile .top { padding:16px 14px 10px; display:flex; align-items:center; gap:10px; }
+  .tile .ico { font-size:40px; line-height:1; filter:drop-shadow(0 2px 0 #0001); }
+  .tile .name { font-weight:800; font-size:20px; }
+  .tile .desc { padding:0 14px; color:var(--ink-soft); font-weight:600; font-size:14px; flex:1; }
+  .tile .chips { display:flex; gap:6px; flex-wrap:wrap; padding:12px 14px; }
+  .chip2 { font-size:12px; font-weight:800; color:#fff; border-radius:999px; padding:3px 9px; }
+  .bar { height:8px; }
+  .foot { text-align:center; color:var(--ink-soft); font-weight:600; padding:34px 16px 50px; position:relative; z-index:1; font-size:14px; }
+  .foot a { color:var(--c-purple); font-weight:800; }
+  .no-results { text-align:center; color:var(--ink-soft); font-weight:700; padding:30px; }
+  .topmini { position:sticky; top:0; z-index:40; display:flex; justify-content:flex-end; gap:8px; padding:10px 14px; }
+</style>
+</head>
+<body>
+<script src="assets/common.js"></script>
+<script src="assets/games.js"></script>
+
+<div class="topmini">
+  <button class="mm-icon-btn" id="soundBtn" title="Sound">🔊</button>
+</div>
+
+<div class="hero">
+  <div style="font-size:56px" id="marquee">🎪 🎲 🃏 🎯 🧩</div>
+  <h1>Mira &amp; Maia's Game Arcade</h1>
+  <p>Lots of math games to play together — or against the computer! 🤖</p>
+  <div class="search-wrap"><input class="search" id="search" placeholder="🔎 Find a game…" autocomplete="off"></div>
+  <div class="legend">
+    <span class="lg">🤖 vs Computer</span>
+    <span class="lg">🧑‍🤝‍🧑 2 Players</span>
+    <span class="lg">🙂 Solo</span>
+    <span class="lg">✨ Explore</span>
+  </div>
+</div>
+
+<div id="root"></div>
+
+<div class="foot">
+  Made with ❤️ for Mira &amp; Maia. The Beast Academy games are playable versions of the free activities at
+  <a href="https://beastacademy.com/playground" target="_blank" rel="noopener">Beast Academy Playground</a> —
+  each game links to its official page. This is a fan-made project, not affiliated with Beast Academy.
+</div>
+
+<script>
+(function(){
+  MM.decor();
+  const MODE = {
+    A:{label:'🤖 Computer', c:'#8338ec'}, '2':{label:'🧑‍🤝‍🧑 2 Players', c:'#3a86ff'},
+    S:{label:'🙂 Solo', c:'#2ec4b6'}, E:{label:'✨ Explore', c:'#ff9f1c'}, P:{label:'🖨️ Print', c:'#ff70a6'}
+  };
+  const root = document.getElementById('root');
+
+  function tile(g){
+    const a = MM.el('a', { class:'tile', href: g.slug + '/index.html' });
+    a.appendChild(MM.el('div',{class:'bar', style:{background:g.color}}));
+    a.appendChild(MM.el('div',{class:'top'},
+      MM.el('div',{class:'ico'}, g.emoji),
+      MM.el('div',{class:'name'}, g.title)
+    ));
+    a.appendChild(MM.el('div',{class:'desc'}, g.desc));
+    a.appendChild(MM.el('div',{class:'chips'},
+      (g.modes||[]).map(m => MM.el('span',{class:'chip2', style:{background:(MODE[m]||{}).c||'#999'}}, (MODE[m]||{}).label||m))
+    ));
+    a.addEventListener('click', ()=> MM.sound.play('pop'));
+    a.dataset.search = (g.title + ' ' + g.desc).toLowerCase();
+    return a;
+  }
+
+  function render(filter){
+    root.innerHTML=''; let shown=0;
+    for(const sec of GAMES.sections){
+      const secEl = MM.el('div',{class:'section'});
+      secEl.appendChild(MM.el('div',{class:'section-head'},
+        MM.el('span',{class:'em'}, sec.emoji), MM.el('span',{class:'st'}, sec.title)));
+      if(sec.blurb) secEl.appendChild(MM.el('p',{class:'section-blurb'}, sec.blurb));
+      let secShown=0;
+      for(const grp of sec.groups){
+        const matches = grp.games.filter(g => !filter || (g.title+' '+g.desc).toLowerCase().includes(filter));
+        if(!matches.length) continue;
+        if(grp.name) secEl.appendChild(MM.el('div',{class:'group-name'}, MM.el('span',{},grp.emoji||''), grp.name));
+        const grid = MM.el('div',{class:'grid'});
+        matches.forEach(g => { grid.appendChild(tile(g)); secShown++; shown++; });
+        secEl.appendChild(grid);
+      }
+      if(secShown) root.appendChild(secEl);
+    }
+    if(!shown) root.appendChild(MM.el('div',{class:'no-results'}, 'No games found — try another word! 🔎'));
+  }
+  render('');
+
+  const search = document.getElementById('search');
+  search.addEventListener('input', ()=> render(search.value.trim().toLowerCase()));
+
+  const sb = document.getElementById('soundBtn');
+  sb.textContent = MM.sound.muted ? '🔇' : '🔊';
+  sb.addEventListener('click', ()=>{ const m = MM.sound.toggle(); sb.textContent = m?'🔇':'🔊'; MM.sound.play('click'); });
+
+  // playful marquee shuffle
+  const emojis = ['🎪','🎲','🃏','🎯','🧩','🐷','🦊','🍪','🚗','🐧','💎','🔺','🦘','🎹','🗺️'];
+  const mq = document.getElementById('marquee');
+  setInterval(()=>{ let s=''; for(let i=0;i<5;i++) s+=emojis[MM.rand(emojis.length)]+' '; mq.textContent=s.trim(); }, 2200);
+})();
+</script>
+</body>
+</html>

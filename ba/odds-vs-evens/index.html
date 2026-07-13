@@ -1,0 +1,331 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Odds &amp; Evens</title>
+<link rel="stylesheet" href="../../assets/common.css">
+</head>
+<body>
+<script src="../../assets/common.js"></script>
+<script>
+/* ODDS & EVENS — on the count of three, both players throw 0–5 fingers.
+   Add the two hands. Even total → Evens wins the round; odd → Odds wins.
+   Best of 5 or 7. A perfectly fair game.
+
+   AI: plays uniformly at random 0..5 (provably unexploitable). */
+
+const HEX = { 1: '#3a86ff', 2: '#ff5a5f' };
+// A hand emoji per finger count 0..5.
+const HAND = ['✊', '☝️', '✌️', '🤟', '🖖', '🖐️'];
+
+MM.game({
+  title: 'Odds & Evens', emoji: '✋',
+  ba: 'https://beastacademy.com/playground/odds-vs-evens',
+  rules: `
+    <p><b>Odds vs. Evens!</b> One player is <b>EVENS</b>, the other is <b>ODDS</b>.</p>
+    <ol>
+      <li>On the count of three, both players throw <b>0 to 5 fingers</b> at the same time. ✋</li>
+      <li><b>Add</b> the two hands together.</li>
+      <li>If the total is <b>even</b> (0, 2, 4…), <b>Evens</b> wins the round.</li>
+      <li>If the total is <b>odd</b> (1, 3, 5…), <b>Odds</b> wins the round.</li>
+      <li>First to win the most in a <b>best-of series</b> wins! 🏆</li>
+    </ol>
+    <p>This game is <b>perfectly fair</b> — even and odd totals happen equally often. It's a fun way to practice adding! ➕</p>`,
+  modes: [
+    { id: 'ai',  emoji: '🤖', name: 'Vs Computer', sub: 'You vs the robot' },
+    { id: 'two', emoji: '🧑‍🤝‍🧑', name: '2 Players', sub: 'Pass & hide' },
+  ],
+  onStart,
+});
+
+function onStart(mode, mount) {
+  const vsAI = (mode === 'ai');
+
+  // options chosen on a small setup screen
+  let bestOf = MM.load('oe-bestof', 5);
+  let humanParity = MM.load('oe-parity', 'even');   // vsAI: which parity the HUMAN is
+
+  let need = Math.ceil((bestOf + 1) / 2);           // wins needed
+  let wins = { even: 0, odd: 0 };
+  let roundNo = 0;
+
+  const panel = MM.el('div', { class: 'mm-panel mm-center mm-bounce-in' });
+  mount.appendChild(panel);
+
+  // In 2-player mode, Player 1 = Evens, Player 2 = Odds (fixed & shown clearly).
+  function parityLabel(p) {
+    if (vsAI) {
+      if (p === 'even') return humanParity === 'even' ? 'You (Evens)' : 'Computer (Evens)';
+      return humanParity === 'odd' ? 'You (Odds)' : 'Computer (Odds)';
+    }
+    return p === 'even' ? 'Player 1 (Evens)' : 'Player 2 (Odds)';
+  }
+  function parityColor(p) {
+    if (vsAI) {
+      const humanIs = (p === humanParity);
+      return humanIs ? HEX[1] : HEX[2];
+    }
+    return p === 'even' ? HEX[1] : HEX[2];
+  }
+
+  function scorebar() {
+    return MM.el('div', { class: 'mm-scorebar' },
+      MM.el('div', { class: 'mm-score' },
+        MM.el('span', { class: 'dot', style: { background: parityColor('even') } }),
+        MM.el('span', {}, '🟦 Evens: ' + wins.even)),
+      MM.el('div', { class: 'mm-score' },
+        MM.el('span', {}, '🎯 First to ' + need)),
+      MM.el('div', { class: 'mm-score' },
+        MM.el('span', { class: 'dot', style: { background: parityColor('odd') } }),
+        MM.el('span', {}, '🟥 Odds: ' + wins.odd)),
+    );
+  }
+
+  /* ---------------- setup screen (best-of + role) ---------------- */
+  function setupScreen() {
+    panel.innerHTML = '';
+    MM.status('<span class="chip" style="background:#ff9f1c">Set up your match</span>');
+    panel.appendChild(MM.el('h2', { class: 'mm-center', style: { marginTop: '4px' } }, '✋ Match settings'));
+
+    // best-of pills
+    panel.appendChild(MM.el('div', { style: { fontWeight: '800', marginTop: '8px' } }, 'How long?'));
+    const boRow = MM.el('div', { class: 'mm-pills', style: { margin: '8px 0 4px' } });
+    [5, 7].forEach(v => {
+      boRow.appendChild(MM.el('button', {
+        class: 'mm-pill', 'aria-pressed': String(v === bestOf),
+        onClick: () => { MM.sound.play('click'); bestOf = v; MM.store('oe-bestof', v); setupScreen(); },
+      }, '🏁 Best of ' + v));
+    });
+    panel.appendChild(boRow);
+
+    if (vsAI) {
+      panel.appendChild(MM.el('div', { style: { fontWeight: '800', marginTop: '14px' } }, 'Which are you?'));
+      const roleRow = MM.el('div', { class: 'mm-pills', style: { margin: '8px 0 4px' } });
+      [['even', '🟦 Evens'], ['odd', '🟥 Odds']].forEach(([id, txt]) => {
+        roleRow.appendChild(MM.el('button', {
+          class: 'mm-pill', 'aria-pressed': String(id === humanParity),
+          onClick: () => { MM.sound.play('click'); humanParity = id; MM.store('oe-parity', id); setupScreen(); },
+        }, txt));
+      });
+      panel.appendChild(roleRow);
+      panel.appendChild(MM.el('div', { class: 'mm-hint' }, "You win a round when the total is " + (humanParity === 'even' ? 'even' : 'odd') + '.'));
+    } else {
+      panel.appendChild(MM.el('div', { class: 'mm-hint', style: { marginTop: '14px' } },
+        'Player 1 is 🟦 Evens. Player 2 is 🟥 Odds.'));
+    }
+
+    panel.appendChild(MM.el('div', { class: 'mm-row' },
+      MM.el('button', {
+        class: 'mm-btn green', style: { fontSize: '20px', padding: '14px 30px', minHeight: '54px', marginTop: '14px' },
+        onClick: () => { MM.sound.play('pop'); startMatch(); },
+      }, '▶️ Start!')));
+  }
+
+  function startMatch() {
+    need = Math.ceil((bestOf + 1) / 2);
+    wins = { even: 0, odd: 0 };
+    roundNo = 0;
+    nextRound();
+  }
+
+  /* ---------------- a single round ---------------- */
+  function nextRound() {
+    roundNo++;
+    if (vsAI) roundVsAI();
+    else roundTwoPlayer();
+  }
+
+  // Big finger picker (0–5). onPick(count).
+  function fingerPicker(who, color, onPick) {
+    const grid = MM.el('div', {
+      style: { display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '12px', maxWidth: '360px', margin: '10px auto' },
+    });
+    for (let n = 0; n <= 5; n++) {
+      const btn = MM.el('button', {
+        class: 'mm-btn', style: {
+          background: color, fontSize: '17px', padding: '0', minHeight: '84px',
+          flexDirection: 'column', gap: '2px', borderRadius: '20px',
+        },
+        onClick: () => { MM.sound.play('pop'); onPick(n); },
+      },
+        MM.el('div', { style: { fontSize: '34px' } }, HAND[n]),
+        MM.el('div', {}, n + (n === 1 ? ' finger' : ' fingers')));
+      grid.appendChild(btn);
+    }
+    return grid;
+  }
+
+  function roundVsAI() {
+    const aiThrow = MM.range(0, 5);   // uniform random — unexploitable
+    panel.innerHTML = '';
+    panel.appendChild(scorebar());
+    MM.status('<span class="chip" style="background:' + HEX[1] + '">Round ' + roundNo + ' — your throw!</span>');
+    panel.appendChild(MM.el('h2', { class: 'mm-center', style: { marginTop: '2px' } }, 'How many fingers? ✋'));
+    panel.appendChild(MM.el('div', { class: 'mm-hint' }, "You're " + (humanParity === 'even' ? '🟦 Evens' : '🟥 Odds') + '. Tap your throw!'));
+    // reveal expects (evenHand, oddHand): if human is Evens the human's throw is
+    // the even hand and the AI throw is the odd hand; otherwise swapped.
+    panel.appendChild(fingerPicker(1, HEX[1], (human) => {
+      const evenHand = humanParity === 'even' ? human : aiThrow;
+      const oddHand = humanParity === 'odd' ? human : aiThrow;
+      doReveal(evenHand, oddHand);
+    }));
+  }
+
+  function roundTwoPlayer() {
+    // Pass-and-hide: Player 1 (Evens) picks behind cover, then Player 2 (Odds).
+    let evenHand = null;
+    cover(1, HEX[1], 'Player 1 (🟦 Evens)', () => {
+      panel.innerHTML = '';
+      panel.appendChild(scorebar());
+      MM.status('<span class="chip" style="background:' + HEX[1] + '">Player 1 throwing…</span>');
+      panel.appendChild(MM.el('h2', { class: 'mm-center', style: { marginTop: '2px' } }, 'Player 1 (Evens) ✋'));
+      panel.appendChild(MM.el('div', { class: 'mm-hint' }, 'Pick your fingers — Player 2, no peeking!'));
+      panel.appendChild(fingerPicker(1, HEX[1], (e) => {
+        evenHand = e;
+        cover(2, HEX[2], 'Player 2 (🟥 Odds)', () => {
+          panel.innerHTML = '';
+          panel.appendChild(scorebar());
+          MM.status('<span class="chip" style="background:' + HEX[2] + '">Player 2 throwing…</span>');
+          panel.appendChild(MM.el('h2', { class: 'mm-center', style: { marginTop: '2px' } }, 'Player 2 (Odds) ✋'));
+          panel.appendChild(MM.el('div', { class: 'mm-hint' }, 'Pick your fingers!'));
+          panel.appendChild(fingerPicker(2, HEX[2], (o) => doReveal(evenHand, o)));
+        });
+      }));
+    });
+  }
+
+  function cover(who, color, name, onReady) {
+    panel.innerHTML = '';
+    panel.appendChild(scorebar());
+    panel.appendChild(MM.el('div', { class: 'mm-center', style: { padding: '16px 6px' } },
+      MM.el('div', { style: { fontSize: '64px' } }, '🙈'),
+      MM.el('h2', {}, 'Pass to'),
+      MM.el('div', { style: { fontSize: '24px', fontWeight: '800', color: color, margin: '4px 0 12px' } }, name),
+      MM.el('div', { class: 'mm-hint' }, 'Everyone else, look away! 👀'),
+      MM.el('button', {
+        class: 'mm-btn', style: { fontSize: '20px', padding: '14px 30px', minHeight: '54px', background: color },
+        onClick: () => { MM.sound.play('swoosh'); onReady(); },
+      }, "👉 I'm ready!")));
+  }
+
+  /* ---------------- reveal + count-of-three animation ---------------- */
+  async function doReveal(evenHand, oddHand) {
+    const total = evenHand + oddHand;
+    const isEven = total % 2 === 0;
+    const roundWinner = isEven ? 'even' : 'odd';
+
+    panel.innerHTML = '';
+    panel.appendChild(scorebar());
+    MM.status('<span class="chip" style="background:#ff9f1c">1… 2… 3… throw!</span>');
+
+    const stage = MM.el('div', { style: { margin: '10px auto' } });
+    panel.appendChild(stage);
+
+    // count of three
+    const counter = MM.el('div', { style: { fontSize: '54px', fontWeight: '800', minHeight: '64px' } });
+    stage.appendChild(counter);
+    for (const c of ['1️⃣', '2️⃣', '3️⃣']) {
+      counter.textContent = c;
+      MM.sound.play('click');
+      await MM.sleep(430);
+    }
+    counter.remove();
+
+    // two hands reveal
+    const hands = MM.el('div', {
+      style: { display: 'flex', justifyContent: 'center', gap: '18px', alignItems: 'flex-end', flexWrap: 'wrap' },
+    });
+    stage.appendChild(hands);
+
+    function handCard(parity, n) {
+      const col = parityColor(parity);
+      return MM.el('div', {
+        style: {
+          background: '#fff', border: '5px solid ' + col, borderRadius: '22px',
+          padding: '12px 18px', minWidth: '128px', boxShadow: '0 8px 0 rgba(0,0,0,.10)',
+          animation: 'bin .35s cubic-bezier(.2,1.3,.4,1)',
+        },
+      },
+        MM.el('div', { style: { fontWeight: '800', color: col, fontSize: '15px' } }, parityLabel(parity)),
+        MM.el('div', { style: { fontSize: '72px', lineHeight: '1.1' } }, HAND[n]),
+        MM.el('div', { style: { fontSize: '30px', fontWeight: '800', color: col } }, String(n)));
+    }
+
+    hands.appendChild(handCard('even', evenHand));
+    MM.sound.play('place');
+    await MM.sleep(300);
+    hands.appendChild(MM.el('div', { style: { fontSize: '40px', fontWeight: '800', alignSelf: 'center' } }, '➕'));
+    hands.appendChild(handCard('odd', oddHand));
+    MM.sound.play('place');
+    await MM.sleep(450);
+
+    // sum + verdict
+    const sumLine = MM.el('div', {
+      style: { fontSize: '30px', fontWeight: '800', margin: '14px 0 4px' },
+    }, evenHand + ' + ' + oddHand + ' = ' + total);
+    stage.appendChild(sumLine);
+    MM.sound.play('ding');
+
+    const parityChip = MM.el('div', {
+      style: {
+        display: 'inline-block', fontSize: '24px', fontWeight: '800', color: '#fff',
+        background: isEven ? HEX[1] : HEX[2], borderRadius: '999px', padding: '8px 22px', marginTop: '4px',
+      },
+    }, total + ' is ' + (isEven ? 'EVEN 🟦' : 'ODD 🟥'));
+    stage.appendChild(parityChip);
+    await MM.sleep(500);
+
+    // award
+    wins[roundWinner]++;
+    const humanWon = vsAI && (roundWinner === humanParity);
+    let verdict;
+    if (vsAI) {
+      verdict = MM.el('div', { style: { fontSize: '24px', fontWeight: '800', marginTop: '12px', color: humanWon ? '#2ec4b6' : HEX[2] } },
+        humanWon ? '🎉 You win this round!' : '🤖 Computer wins this round!');
+    } else {
+      verdict = MM.el('div', { style: { fontSize: '24px', fontWeight: '800', marginTop: '12px', color: parityColor(roundWinner) } },
+        '🎉 ' + parityLabel(roundWinner) + ' wins the round!');
+    }
+    stage.appendChild(verdict);
+    if (!vsAI || humanWon) { MM.sound.play('star'); MM.confetti({ count: 60 }); }
+    else MM.sound.play('pop');
+
+    // refresh scorebar
+    panel.replaceChild(scorebar(), panel.firstChild);
+
+    const matchOver = wins.even >= need || wins.odd >= need;
+    const btn = MM.el('button', {
+      class: 'mm-btn', style: { fontSize: '20px', padding: '14px 28px', minHeight: '54px', marginTop: '14px' },
+      onClick: () => { MM.sound.play('click'); if (matchOver) finishMatch(); else nextRound(); },
+    }, matchOver ? '🏁 See the champion' : '➡️ Next throw');
+    panel.appendChild(MM.el('div', { class: 'mm-row' }, btn));
+    MM.status('<span class="chip" style="background:#2ec4b6">Evens ' + wins.even + ' — ' + wins.odd + ' Odds</span>');
+  }
+
+  function finishMatch() {
+    const champ = wins.even > wins.odd ? 'even' : 'odd';
+    if (vsAI) {
+      const youWin = champ === humanParity;
+      MM.win({
+        lose: !youWin,
+        title: youWin ? 'You win the match! 🎉' : 'The robot wins the match!',
+        emoji: youWin ? '🏆' : '🤖',
+        sub: 'Final — Evens ' + wins.even + ' : ' + wins.odd + ' Odds. It was a fair fight (50/50)!',
+        onAgain: () => MM.toMenu(),
+      });
+    } else {
+      MM.win({
+        title: parityLabel(champ) + ' win the match! 🎉',
+        emoji: champ === 'even' ? '🟦' : '🟥',
+        sub: 'Final — Evens ' + wins.even + ' : ' + wins.odd + ' Odds',
+        onAgain: () => MM.toMenu(),
+      });
+    }
+  }
+
+  setupScreen();
+}
+</script>
+</body>
+</html>

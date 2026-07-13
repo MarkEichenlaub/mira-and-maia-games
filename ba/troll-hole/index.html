@@ -1,0 +1,370 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Troll Hole</title>
+<link rel="stylesheet" href="../../assets/common.css">
+</head>
+<body>
+<script src="../../assets/common.js"></script>
+<script>
+/* TROLL HOLE — hexagonal board of 19 circles (rows of 3,4,5,4,3).
+   Players alternate WRITING numbers, counting up: P1 writes 1, P2 writes 1, P1 writes 2,
+   P2 writes 2 … each writes 1..9 (18 numbers). One circle stays empty = the TROLL HOLE.
+   The troll then EATS every number in a circle ADJACENT to the hole. Each player sums
+   their REMAINING (un-eaten) numbers; HIGHER sum WINS.
+   Strategy: put big numbers far from where the hole will be; push the opponent's big
+   numbers next to the eventual hole.
+
+   AI: heuristic with shallow lookahead. Full minimax over 19 placements is huge, so for
+   each candidate placement we estimate the expected (my final sum − opp final sum) by
+   approximating the final empty cell across the still-open cells, then optionally do a
+   1-ply opponent reply. Easy/Smart pill. */
+
+const HEX = { 1: '#3a86ff', 2: '#ff5a5f' };
+
+/* ---- Board geometry: 19 hex cells in rows of 3,4,5,4,3 (axial-ish). ----
+   We lay them out on a triangular grid and compute adjacency by pixel distance. */
+const ROWS = [3, 4, 5, 4, 3];
+const CELLS = [];                        // { id, cx, cy } in unit coords
+(function buildCells() {
+  const dx = 1;                          // horizontal spacing
+  const dy = 0.9;                        // vertical spacing (rows)
+  let id = 0;
+  for (let r = 0; r < ROWS.length; r++) {
+    const n = ROWS[r];
+    const rowW = (n - 1) * dx;
+    const y = r * dy;
+    for (let i = 0; i < n; i++) {
+      const x = i * dx - rowW / 2;       // centered
+      CELLS.push({ id: id++, x, y, row: r, col: i });
+    }
+  }
+})();
+const NC = CELLS.length;                 // 19
+
+// adjacency: neighbours within ~1.05 unit distance
+const ADJ = CELLS.map(() => []);
+for (let a = 0; a < NC; a++) for (let b = a + 1; b < NC; b++) {
+  const dxv = CELLS[a].x - CELLS[b].x, dyv = CELLS[a].y - CELLS[b].y;
+  const d = Math.hypot(dxv, dyv);
+  if (d < 1.05) { ADJ[a].push(b); ADJ[b].push(a); }
+}
+
+MM.game({
+  title: 'Troll Hole', emoji: '🧌',
+  ba: 'https://beastacademy.com/playground/troll-hole',
+  rules: `
+    <p><b>Feed the troll… someone else's numbers!</b> There are 19 circles.</p>
+    <ol>
+      <li>Take turns writing numbers, counting up: you write your <b>1</b>, then your friend
+          writes their <b>1</b>, then your <b>2</b>, and so on up to <b>9</b>.</li>
+      <li>One circle is left empty — that's the <b>troll hole</b> 🕳️.</li>
+      <li>The troll <b>eats every number touching the hole</b> (they don't count anymore).</li>
+      <li>Add up your <b>leftover</b> numbers. <b>Higher total WINS!</b> 🏆</li>
+    </ol>
+    <p><b>Sneaky plan:</b> tuck your BIG numbers far from empty space, and try to leave your
+    friend's big numbers next to the last empty circle!</p>`,
+  modes: [
+    { id: 'ai',  emoji: '🤖', name: 'Vs Computer', sub: 'You are blue' },
+    { id: 'two', emoji: '🧑‍🤝‍🧑', name: '2 Players', sub: 'Pass & play' },
+  ],
+  onStart,
+});
+
+function onStart(mode, mount) {
+  const vsAI = mode === 'ai';
+  const AI = 2;
+  let hard = MM.load('troll-hard', true);
+
+  // state
+  let cellOwner, cellVal, nextNum, turn, over, busy;
+
+  const panel = MM.el('div', { class: 'mm-panel mm-center mm-bounce-in' });
+
+  const pillRow = MM.el('div', { class: 'mm-pills', style: { marginBottom: '10px' } });
+  function buildPills() {
+    pillRow.innerHTML = '';
+    if (!vsAI) return;
+    pillRow.appendChild(MM.el('span', { style: { fontWeight: '800', alignSelf: 'center', marginRight: '2px' } }, 'Robot:'));
+    [['Easy', false, '🐣'], ['Smart', true, '🧠']].forEach(([name, val, em]) => {
+      pillRow.appendChild(MM.el('button', {
+        class: 'mm-pill', 'aria-pressed': String(val === hard),
+        onClick: () => { if (busy) return; MM.sound.play('click'); hard = val; MM.store('troll-hard', val); buildPills(); reset(); },
+      }, em + ' ' + name));
+    });
+  }
+
+  const scorebar = MM.el('div', { class: 'mm-scorebar' });
+
+  // SVG board
+  const size = Math.min(460, window.innerWidth - 32);
+  const svgNS = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(svgNS, 'svg');
+  // compute view bounds from cells
+  const xs = CELLS.map(c => c.x), ys = CELLS.map(c => c.y);
+  const minX = Math.min(...xs), maxX = Math.max(...xs), minY = Math.min(...ys), maxY = Math.max(...ys);
+  const pad = 0.75;
+  const vw = (maxX - minX) + pad * 2, vh = (maxY - minY) + pad * 2;
+  svg.setAttribute('viewBox', `${minX - pad} ${minY - pad} ${vw} ${vh}`);
+  svg.style.width = size + 'px'; svg.style.maxWidth = '100%'; svg.style.height = 'auto';
+  svg.style.touchAction = 'manipulation'; svg.style.display = 'block'; svg.style.margin = '6px auto';
+
+  const hint = MM.el('div', { class: 'mm-hint' });
+  const trollIcon = MM.el('div', { style: { fontSize: '40px', height: '0', overflow: 'visible' } });
+
+  panel.append(pillRow, scorebar, svg, hint);
+  mount.appendChild(panel);
+
+  const R = 0.42;                          // circle radius in unit coords
+
+  // ---------- render ----------
+  function render(opts) {
+    opts = opts || {};
+    svg.innerHTML = '';
+    for (const cell of CELLS) {
+      const g = document.createElementNS(svgNS, 'g');
+      const circ = document.createElementNS(svgNS, 'circle');
+      circ.setAttribute('cx', cell.x); circ.setAttribute('cy', cell.y); circ.setAttribute('r', R);
+      const owner = cellOwner[cell.id];
+      let fill = '#ffffff', stroke = '#d9cfe8';
+      if (owner) { fill = HEX[owner]; stroke = owner === 1 ? '#2f6fd6' : '#e14a50'; }
+      if (opts.hole === cell.id) { fill = '#3a2c1c'; stroke = '#7a5a30'; }
+      if (opts.eaten && opts.eaten.has(cell.id)) { stroke = '#22223b'; }
+      circ.setAttribute('fill', fill);
+      circ.setAttribute('stroke', stroke);
+      circ.setAttribute('stroke-width', 0.06);
+      if (!owner && !over && !opts.hole) {
+        circ.style.cursor = 'pointer';
+        circ.addEventListener('click', () => humanPlace(cell.id));
+        circ.classList.add('th-open');
+      }
+      g.appendChild(circ);
+      if (owner) {
+        const t = document.createElementNS(svgNS, 'text');
+        t.setAttribute('x', cell.x); t.setAttribute('y', cell.y + 0.02);
+        t.setAttribute('text-anchor', 'middle'); t.setAttribute('dominant-baseline', 'central');
+        t.setAttribute('fill', '#fff'); t.setAttribute('font-weight', '900');
+        t.setAttribute('font-size', '0.5'); t.setAttribute('font-family', 'inherit');
+        t.textContent = String(cellVal[cell.id]);
+        if (opts.eaten && opts.eaten.has(cell.id)) { t.setAttribute('fill', '#ffffff'); }
+        g.appendChild(t);
+        if (opts.eaten && opts.eaten.has(cell.id)) {
+          // strike-through cross
+          const x1 = cell.x - R * 0.7, x2 = cell.x + R * 0.7, y = cell.y;
+          const ln = document.createElementNS(svgNS, 'line');
+          ln.setAttribute('x1', x1); ln.setAttribute('y1', y); ln.setAttribute('x2', x2); ln.setAttribute('y2', y);
+          ln.setAttribute('stroke', '#22223b'); ln.setAttribute('stroke-width', 0.09); ln.setAttribute('stroke-linecap', 'round');
+          g.appendChild(ln);
+          circ.setAttribute('opacity', 0.45);
+        }
+      } else if (opts.hole === cell.id) {
+        const t = document.createElementNS(svgNS, 'text');
+        t.setAttribute('x', cell.x); t.setAttribute('y', cell.y + 0.02);
+        t.setAttribute('text-anchor', 'middle'); t.setAttribute('dominant-baseline', 'central');
+        t.setAttribute('font-size', '0.5');
+        t.textContent = '🧌';
+        g.appendChild(t);
+      }
+      svg.appendChild(g);
+    }
+    renderScore(opts);
+    if (!opts.suppressStatus) statusUpdate();
+  }
+
+  function liveSums() {
+    // running totals ignoring eating (used during play)
+    let s1 = 0, s2 = 0;
+    for (let i = 0; i < NC; i++) { if (cellOwner[i] === 1) s1 += cellVal[i]; else if (cellOwner[i] === 2) s2 += cellVal[i]; }
+    return [s1, s2];
+  }
+
+  function renderScore(opts) {
+    scorebar.innerHTML = '';
+    const sums = opts && opts.finalSums ? opts.finalSums : liveSums();
+    [1, 2].forEach(pl => {
+      const name = vsAI ? (pl === AI ? '🤖 Computer' : '🧒 You') : ('Player ' + pl);
+      const s = MM.el('div', { class: 'mm-score' + (turn === pl && !over ? ' active' : '') },
+        MM.el('span', { class: 'dot', style: { background: HEX[pl] } }),
+        name, MM.el('span', { style: { color: HEX[pl] } }, sums[pl - 1] + ''));
+      scorebar.appendChild(s);
+    });
+  }
+
+  function statusUpdate() {
+    if (over) return;
+    const who = vsAI ? (turn === AI ? '🤖 Computer…' : '🧒 Your turn') : ('Player ' + turn + "'s turn");
+    const myNum = nextNum[turn];
+    MM.status(`<span class="chip" style="background:${HEX[turn]}">${who}: write <b>${myNum}</b></span>`);
+    if (vsAI && turn === AI) hint.textContent = 'The computer is placing its ' + myNum + '…';
+    else hint.textContent = 'Tap an empty circle to write your ' + myNum + '.';
+  }
+
+  // ---------- placement ----------
+  function place(id, pl) {
+    cellOwner[id] = pl;
+    cellVal[id] = nextNum[pl];
+    nextNum[pl]++;
+    MM.sound.play('place');
+    render();
+    // last empty cell?
+    const empties = [];
+    for (let i = 0; i < NC; i++) if (!cellOwner[i]) empties.push(i);
+    if (empties.length === 1) { endGame(empties[0]); return; }
+    turn = turn === 1 ? 2 : 1;
+    render();
+    if (vsAI && turn === AI && !over) { busy = true; statusUpdate(); setTimeout(aiTurn, 520); }
+  }
+
+  async function humanPlace(id) {
+    if (over || busy || cellOwner[id]) return;
+    if (vsAI && turn === AI) return;
+    busy = true;
+    place(id, turn);
+    if (!(vsAI && turn === AI)) busy = false;
+  }
+
+  // ---------- scoring given a hole ----------
+  function scoreWithHole(oArr, vArr, hole) {
+    const eaten = new Set(ADJ[hole]);
+    let s1 = 0, s2 = 0;
+    for (let i = 0; i < NC; i++) {
+      if (i === hole || eaten.has(i)) continue;
+      if (oArr[i] === 1) s1 += vArr[i]; else if (oArr[i] === 2) s2 += vArr[i];
+    }
+    return [s1, s2];
+  }
+
+  // ---------- AI ----------
+  // For a hypothetical filled board (owner/val arrays + which cell is the hole is unknown
+  // until end), we estimate value of a candidate placement by averaging over plausible
+  // final holes among currently-empty cells.
+  function emptyCells(oArr) { const e = []; for (let i = 0; i < NC; i++) if (!oArr[i]) e.push(i); return e; }
+
+  // Expected (AI - opp) score treating each still-empty cell as equally likely to end as
+  // the hole. This captures "damage if the hole lands here" for the current board.
+  function expectedDiff(oArr, vArr) {
+    const empties = emptyCells(oArr);
+    if (empties.length === 0) return 0;
+    let tot = 0;
+    for (const h of empties) {
+      const [s1, s2] = scoreWithHole(oArr, vArr, h);
+      tot += (AI === 1 ? s1 - s2 : s2 - s1);
+    }
+    return tot / empties.length;
+  }
+
+  function aiTurn() {
+    if (over) return;
+    const empties = emptyCells(cellOwner);
+    let choice;
+    if (!hard && Math.random() < 0.55) {
+      choice = MM.choice(empties);
+    } else {
+      choice = smartChoice(empties);
+    }
+    place(choice, AI);
+    busy = false;
+    statusUpdate();
+  }
+
+  function smartChoice(empties) {
+    const myNum = nextNum[AI];
+    let best = empties[0], bestScore = -Infinity;
+    // Only worth a 1-ply opponent reply when the board still has several empties.
+    const doReply = hard && empties.length >= 3 && empties.length <= 12;
+    for (const id of MM.shuffle(empties.slice())) {
+      cellOwner[id] = AI; cellVal[id] = myNum;
+      let score;
+      if (doReply) {
+        // opponent will place their next number to MINIMISE our expected diff
+        const opp = AI === 1 ? 2 : 1;
+        const oppNum = nextNum[opp];
+        const rest = emptyCells(cellOwner);
+        if (rest.length === 0) { score = expectedDiff(cellOwner, cellVal); }
+        else {
+          let worst = Infinity;
+          for (const oid of rest) {
+            cellOwner[oid] = opp; cellVal[oid] = oppNum;
+            const d = expectedDiff(cellOwner, cellVal);
+            cellOwner[oid] = 0; cellVal[oid] = 0;
+            if (d < worst) worst = d;
+          }
+          score = worst;
+        }
+      } else {
+        score = expectedDiff(cellOwner, cellVal);
+      }
+      // small nudge: prefer putting big numbers where few empty neighbours remain
+      // (less likely to be eaten), and small numbers near empty space.
+      const openNbrs = ADJ[id].filter(n => !cellOwner[n]).length;
+      score += (myNum >= 6 ? -openNbrs * 0.25 : openNbrs * 0.12);
+      cellOwner[id] = 0; cellVal[id] = 0;
+      if (score > bestScore) { bestScore = score; best = id; }
+    }
+    return best;
+  }
+
+  // ---------- end: animate the troll eating ----------
+  async function endGame(hole) {
+    over = true;
+    busy = true;
+    MM.sound.play('swoosh');
+    // reveal the hole
+    render({ hole, suppressStatus: true });
+    MM.status(`<span class="chip" style="background:#3a2c1c">🧌 The troll wakes up!</span>`);
+    hint.textContent = 'The troll gobbles the circles touching the hole…';
+    await MM.sleep(700);
+    // eat neighbours one by one
+    const eaten = new Set();
+    for (const n of ADJ[hole]) {
+      eaten.add(n);
+      MM.sound.play('wrong');
+      render({ hole, eaten, suppressStatus: true });
+      await MM.sleep(320);
+    }
+    const [s1, s2] = scoreWithHole(cellOwner, cellVal, hole);
+    render({ hole, eaten, suppressStatus: true, finalSums: [s1, s2] });
+    await MM.sleep(400);
+    finish(hole, s1, s2);
+  }
+
+  function finish(hole, s1, s2) {
+    let winner = s1 > s2 ? 1 : (s2 > s1 ? 2 : 0);
+    const sub = 'Blue ' + s1 + '  vs  Red ' + s2;
+    if (winner === 0) {
+      MM.sound.play('ding');
+      MM.win({ lose: false, title: "It's a tie! 🤝", emoji: '🤝', sub, onAgain: () => MM.toMenu() });
+      return;
+    }
+    if (vsAI) {
+      const youWin = winner !== AI;
+      MM.win({ lose: !youWin, title: youWin ? 'You win! 🎉' : 'Computer wins!',
+        emoji: youWin ? '🏆' : '🤖', sub, onAgain: () => MM.toMenu() });
+    } else {
+      MM.win({ title: 'Player ' + winner + ' wins! 🎉', emoji: winner === 1 ? '🔵' : '🔴',
+        sub, onAgain: () => MM.toMenu() });
+    }
+  }
+
+  function reset() {
+    cellOwner = Array(NC).fill(0);
+    cellVal = Array(NC).fill(0);
+    nextNum = { 1: 1, 2: 1 };
+    turn = 1; over = false; busy = false;
+    render();
+    // Player 1 goes first; AI is P2 so no auto-move at start.
+  }
+
+  buildPills();
+  reset();
+}
+</script>
+<style>
+  .th-open { transition: fill .12s ease; }
+  .th-open:hover { fill: #fff8ec; }
+  svg text { pointer-events: none; user-select: none; }
+</style>
+</body>
+</html>

@@ -1,0 +1,399 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Bumper Cars</title>
+<link rel="stylesheet" href="../../assets/common.css">
+</head>
+<body>
+<script src="../../assets/common.js"></script>
+<script>
+/* BUMPER CARS — a one-way road of dots. Two RED cars + one BLUE car sit on
+   separate dots (blue must NOT start ahead of both reds). Players alternate.
+   On your turn you must do ONE of:
+     (a) move any car FORWARD any number of EMPTY dots (cars can't pass each
+         other, so a car stops behind the next occupied dot), or
+     (b) pick up the FRONT-most car on the road (any color).
+   Whoever picks up the BLUE car WINS.
+
+   AI: perfect minimax over the tiny state (positions of the 3 cars, or "off",
+   + whose turn). Terminal = someone picked up blue → that mover wins. */
+
+MM.game({
+  title: 'Bumper Cars', emoji: '🚗',
+  ba: 'https://beastacademy.com/playground/bumper-cars',
+  rules: `
+    <p><b>Grab the blue car to win!</b> Cars drive one way down the road ➡️.</p>
+    <ol>
+      <li>On your turn you do <b>one</b> thing:</li>
+      <li>➡️ <b>Slide a car forward</b> over empty dots (cars can't jump over each other), or</li>
+      <li>🏁 <b>Pick up the front car</b> (the one furthest ahead).</li>
+      <li>Whoever <b>picks up the BLUE car</b> 🔵 <b>WINS!</b> 🏆</li>
+    </ol>
+    <p>Think ahead — you don't always want to be the one who grabs it early!</p>`,
+  modes: [
+    { id: 'ai',  emoji: '🤖', name: 'Vs Computer', sub: 'You go first' },
+    { id: 'two', emoji: '🧑‍🤝‍🧑', name: '2 Players', sub: 'Pass & play' },
+  ],
+  onStart,
+});
+
+const HEX = { 1: '#3a86ff', 2: '#ff5a5f' };
+
+function onStart(mode, mount) {
+  const vsAI = (mode === 'ai');
+  const AI = 2;                 // computer is player 2; human goes first
+  let LEN = MM.load('bump-len', 8);
+
+  // state: cars = [{color, pos}] where pos is 0..LEN-1 on road, or -1 = picked up.
+  // color: 'r' or 'b'. Two reds, one blue.
+  let cars = [];
+  let turn = 1;
+  let over = false;
+  let busy = false;
+  let selCar = -1;             // index of selected car (for showing forward stops)
+
+  // ---- layout ----
+  const panel = MM.el('div', { class: 'mm-panel mm-center mm-bounce-in' });
+
+  const pillRow = MM.el('div', { class: 'mm-pills', style: { marginBottom: '12px' } });
+  function buildPills() {
+    pillRow.innerHTML = '';
+    pillRow.appendChild(MM.el('span', { style: { fontWeight: '800', alignSelf: 'center', marginRight: '4px' } }, 'Road:'));
+    [8, 10].forEach(v => {
+      pillRow.appendChild(MM.el('button', {
+        class: 'mm-pill', 'aria-pressed': String(v === LEN),
+        onClick: () => { if (busy) return; MM.sound.play('click'); LEN = v; MM.store('bump-len', v); reset(); },
+      }, '🛣️ ' + v));
+    });
+  }
+
+  const track = MM.el('div', {
+    style: {
+      position: 'relative', margin: '10px auto', maxWidth: '100%',
+      overflowX: 'auto', padding: '6px 2px',
+    },
+  });
+
+  const pickBtn = MM.el('button', {
+    class: 'mm-btn orange', style: { fontSize: '19px', padding: '15px 24px', minHeight: '54px', marginTop: '8px' },
+  }, '🏁 Pick up front car');
+
+  const hint = MM.el('div', { class: 'mm-hint' });
+
+  panel.append(pillRow, track, MM.el('div', { class: 'mm-row' }, pickBtn), hint);
+  mount.appendChild(panel);
+
+  // ---- state helpers (pure) ----
+  function occupied(state) {
+    const m = {};
+    state.forEach((c, i) => { if (c.pos >= 0) m[c.pos] = i; });
+    return m;
+  }
+  function onRoad(state) { return state.filter(c => c.pos >= 0); }
+  function frontCarIndex(state) {
+    let best = -1, bestPos = -1;
+    state.forEach((c, i) => { if (c.pos > bestPos) { bestPos = c.pos; best = i; } });
+    return best;
+  }
+  // forward empty stops for car i: dots strictly ahead up to (but not reaching) next occupied
+  function forwardStops(state, i) {
+    const c = state[i]; if (c.pos < 0) return [];
+    const occ = occupied(state);
+    const stops = [];
+    for (let p = c.pos + 1; p < LEN; p++) {
+      if (occ[p] !== undefined) break;   // blocked by a car ahead
+      stops.push(p);
+    }
+    return stops;
+  }
+
+  // enumerate all legal moves from a state. move = {type:'slide',car,to} or {type:'pick',car}
+  function legalMoves(state) {
+    const moves = [];
+    state.forEach((c, i) => {
+      if (c.pos < 0) return;
+      for (const to of forwardStops(state, i)) moves.push({ type: 'slide', car: i, to });
+    });
+    const f = frontCarIndex(state);
+    if (f >= 0) moves.push({ type: 'pick', car: f });
+    return moves;
+  }
+
+  function applyMove(state, mv) {
+    const ns = state.map(c => ({ color: c.color, pos: c.pos }));
+    if (mv.type === 'slide') ns[mv.car].pos = mv.to;
+    else ns[mv.car].pos = -1;
+    return ns;
+  }
+
+  // ---- Perfect AI: minimax. Returns +1 if side-to-move can force a win. ----
+  const memo = new Map();
+  function keyOf(state, toMove) {
+    // positions in fixed car order; -1 -> LEN as a sentinel digit
+    let k = toMove.toString();
+    for (const c of state) k += ',' + c.pos;
+    return k;
+  }
+  // returns true if `toMove` can force picking up the blue car themselves.
+  function winnable(state, toMove) {
+    const key = keyOf(state, toMove);
+    const cached = memo.get(key);
+    if (cached !== undefined) return cached;
+    let result = false;
+    for (const mv of legalMoves(state)) {
+      if (mv.type === 'pick' && state[mv.car].color === 'b') { result = true; break; } // I grab blue → I win
+      const ns = applyMove(state, mv);
+      // if that pick removed blue? only handled above. Otherwise recurse.
+      const oppWins = winnable(ns, toMove === 1 ? 2 : 1);
+      if (!oppWins) { result = true; break; }
+    }
+    memo.set(key, result);
+    return result;
+  }
+
+  function bestAIMove() {
+    memo.clear();
+    const moves = MM.shuffle(legalMoves(cars));
+    // 1) immediate win: grab blue if it's the front car
+    for (const mv of moves) if (mv.type === 'pick' && cars[mv.car].color === 'b') return mv;
+    // 2) a move that leaves opponent unable to win
+    for (const mv of moves) {
+      const ns = applyMove(cars, mv);
+      if (!winnable(ns, AI === 1 ? 2 : 1)) return mv;
+    }
+    // 3) losing anyway — avoid handing blue to opponent if possible; else any move
+    for (const mv of moves) {
+      if (mv.type === 'pick') continue;               // don't pick (would only matter if front were blue, handled)
+      const ns = applyMove(cars, mv);
+      const f = frontCarIndex(ns);
+      if (f < 0 || ns[f].color !== 'b') return mv;     // don't leave blue as the front for opp to grab
+    }
+    return moves[0];
+  }
+
+  // ---- rendering ----
+  function carEmoji(color) { return color === 'b' ? '🔵🚙' : '🔴🏎️'; }
+  function carGlyph(color) { return color === 'b' ? '🚙' : '🏎️'; }
+
+  function label(pl) {
+    if (!vsAI) return 'Player ' + pl;
+    return pl === AI ? 'Computer' : 'You';
+  }
+
+  function statusUpdate() {
+    if (over) return;
+    const who = vsAI ? (turn === AI ? 'Computer…' : 'Your turn') : ('Player ' + turn + "'s turn");
+    MM.status(`<span class="chip" style="background:${HEX[turn]}">${who}</span>`);
+  }
+
+  function render() {
+    track.innerHTML = '';
+    const occ = occupied(cars);
+    const dotSize = Math.max(40, Math.min(64, Math.floor((Math.min(window.innerWidth - 60, 720)) / LEN) - 8));
+    const lane = MM.el('div', {
+      style: {
+        display: 'inline-flex', gap: '8px', alignItems: 'center',
+        background: 'linear-gradient(#5b6b7a,#43505c)', padding: '14px 12px',
+        borderRadius: '18px', boxShadow: 'inset 0 0 0 4px #3a4550',
+      },
+    });
+    // start flag
+    lane.appendChild(MM.el('div', { style: { fontSize: dotSize * 0.5 + 'px', color: '#fff' } }, '🚦'));
+
+    const showStops = (selCar >= 0 && !over && (!vsAI || turn !== AI)) ? forwardStops(cars, selCar) : [];
+
+    for (let p = 0; p < LEN; p++) {
+      const carIdx = occ[p];
+      const isStop = showStops.includes(p);
+      const dot = MM.el('div', {
+        style: {
+          width: dotSize + 'px', height: dotSize + 'px', borderRadius: '50%', flex: '0 0 auto',
+          display: 'flex', alignItems: 'center', justifyContent: 'center', position: 'relative',
+          fontSize: dotSize * 0.6 + 'px', cursor: 'default',
+          background: isStop ? 'var(--c-yellow)' : '#cdd6df',
+          boxShadow: isStop ? '0 0 0 4px #ff9f1c' : 'inset 0 -4px 0 rgba(0,0,0,.12)',
+          transition: 'transform .12s ease, background .12s ease',
+        },
+      });
+      // dashed lane center marks between dots
+      if (carIdx !== undefined) {
+        const c = cars[carIdx];
+        const sel = selCar === carIdx;
+        const carEl = MM.el('div', {
+          style: {
+            cursor: (!over && (!vsAI || turn !== AI)) ? 'pointer' : 'default',
+            transform: sel ? 'scale(1.18)' : 'scale(1)',
+            filter: sel ? 'drop-shadow(0 0 6px #ffd23f)' : 'none',
+            transition: 'transform .15s ease',
+          },
+          onClick: () => carClick(carIdx),
+        }, carGlyph(c.color));
+        // color ring under car
+        carEl.style.textShadow = c.color === 'b'
+          ? '0 0 0 #3a86ff' : '0 0 0 #ff5a5f';
+        const badge = MM.el('div', {
+          style: {
+            position: 'absolute', bottom: '-3px', width: '60%', height: '7px', borderRadius: '6px',
+            background: c.color === 'b' ? '#3a86ff' : '#ff5a5f',
+          },
+        });
+        dot.appendChild(carEl); dot.appendChild(badge);
+      } else if (isStop) {
+        dot.appendChild(MM.el('div', { style: { fontSize: dotSize * 0.5 + 'px' } }, '⤵️'));
+        dot.style.cursor = 'pointer';
+        dot.addEventListener('click', () => { if (selCar >= 0) slideTo(selCar, p); });
+      }
+      lane.appendChild(dot);
+    }
+    // finish flag
+    lane.appendChild(MM.el('div', { style: { fontSize: dotSize * 0.5 + 'px' } }, '🏁'));
+    track.appendChild(lane);
+
+    // enable/disable pick button
+    const canAct = !over && !busy && (!vsAI || turn !== AI);
+    pickBtn.disabled = !canAct || onRoad(cars).length === 0;
+    const f = frontCarIndex(cars);
+    pickBtn.innerHTML = (f >= 0)
+      ? '🏁 Pick up front car (' + (cars[f].color === 'b' ? '🔵 blue' : '🔴 red') + ')'
+      : '🏁 Pick up front car';
+
+    if (over) hint.textContent = '';
+    else if (vsAI && turn === AI) hint.textContent = 'The computer is planning its move…';
+    else if (selCar >= 0) hint.textContent = 'Tap a glowing dot to move there, or tap the car again to unselect.';
+    else hint.textContent = 'Tap a car to move it forward, or use the button to pick up the front car.';
+
+    statusUpdate();
+  }
+
+  function carClick(i) {
+    if (over || busy) return;
+    if (vsAI && turn === AI) return;
+    MM.sound.play('click');
+    if (selCar === i) { selCar = -1; render(); return; }
+    if (forwardStops(cars, i).length === 0) { selCar = -1; render(); return; } // nowhere to go
+    selCar = i; render();
+  }
+
+  async function slideTo(i, to) {
+    if (over || busy) return;
+    busy = true; selCar = -1;
+    cars[i].pos = to;
+    MM.sound.play('swoosh');
+    render();
+    await MM.sleep(160);
+    endTurn();
+  }
+
+  async function pickFront() {
+    if (over || busy) return;
+    if (vsAI && turn === AI) return;
+    const f = frontCarIndex(cars);
+    if (f < 0) return;
+    busy = true; selCar = -1;
+    await doPick(f, turn);
+  }
+
+  async function doPick(f, pl) {
+    const color = cars[f].color;
+    cars[f].pos = -1;
+    MM.sound.play(color === 'b' ? 'ding' : 'pop');
+    render();
+    await MM.sleep(180);
+    if (color === 'b') { finish(pl); return; }         // picked up blue → this player wins
+    endTurn();
+  }
+
+  function endTurn() {
+    if (over) return;
+    turn = turn === 1 ? 2 : 1;
+    render();
+    if (vsAI && turn === AI) { busy = true; render(); setTimeout(aiTurn, 650); }
+    else busy = false;
+  }
+
+  async function aiTurn() {
+    if (over) return;
+    const mv = bestAIMove();
+    if (mv.type === 'pick') {
+      // show which car briefly
+      selCar = mv.car; render(); await MM.sleep(300); selCar = -1;
+      await doPick(mv.car, AI);
+    } else {
+      selCar = mv.car; render(); await MM.sleep(320);
+      cars[mv.car].pos = mv.to; selCar = -1;
+      MM.sound.play('swoosh'); render();
+      await MM.sleep(160);
+      endTurn();
+    }
+  }
+
+  function finish(winnerPl) {
+    over = true; busy = false; selCar = -1;
+    render();
+    if (vsAI) {
+      const youWin = winnerPl !== AI;
+      MM.win({
+        lose: !youWin,
+        title: youWin ? 'You grabbed the blue car! 🎉' : 'Computer got the blue car!',
+        emoji: youWin ? '🏆' : '🤖',
+        sub: youWin ? 'Nice planning!' : 'Sometimes you want the OTHER player stuck grabbing it!',
+        onAgain: () => MM.toMenu(),
+      });
+    } else {
+      MM.win({
+        title: label(winnerPl) + ' wins! 🎉',
+        emoji: winnerPl === 1 ? '🔵' : '🔴',
+        sub: 'Picked up the blue car!',
+        onAgain: () => MM.toMenu(),
+      });
+    }
+  }
+
+  // ---- setup a valid start position ----
+  function setupCars() {
+    // pick 3 distinct dots; blue must NOT be ahead of both reds (i.e. not the front car).
+    // Keep them in the back half-ish so there's room to play, but randomize a bit.
+    while (true) {
+      const spots = shuffledRange();
+      const chosen = spots.slice(0, 3).sort((a, b) => a - b);
+      // assign: blue not the maximum position
+      const bluePos = MM.choice(chosen.filter(p => p < chosen[chosen.length - 1]));
+      if (bluePos === undefined) continue;
+      const redPositions = chosen.filter(p => p !== bluePos);
+      // need exactly 2 reds
+      if (redPositions.length !== 2) continue;
+      cars = [
+        { color: 'b', pos: bluePos },
+        { color: 'r', pos: redPositions[0] },
+        { color: 'r', pos: redPositions[1] },
+      ];
+      return;
+    }
+  }
+  function shuffledRange() {
+    const a = [];
+    // keep cars within the back ~70% of the road so there's forward room
+    const hi = Math.max(3, Math.floor(LEN * 0.7));
+    for (let i = 0; i < hi; i++) a.push(i);
+    return MM.shuffle(a);
+  }
+
+  function reset() {
+    over = false; busy = false; selCar = -1; turn = 1;
+    memo.clear();
+    setupCars();
+    buildPills();
+    render();
+    // human moves first in vsAI
+  }
+
+  pickBtn.addEventListener('click', pickFront);
+  window.addEventListener('resize', () => { if (!over) render(); });
+
+  reset();
+}
+</script>
+</body>
+</html>

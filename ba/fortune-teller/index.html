@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Magic Fortune Teller</title>
+<link rel="stylesheet" href="../../assets/common.css">
+</head>
+<body>
+<script src="../../assets/common.js"></script>
+<script>
+/* MAGIC FORTUNE TELLER — a symmetry trick.
+   A square tile has an arrow drawn on BOTH faces. When you flip the tile by
+   holding two opposite corners, you rotate 180° about that diagonal axis.
+   Which diagonal you hold changes where the arrow ends up pointing — that's
+   the magic.
+
+   MODELING (kept faithful & correct):
+   We track the arrow with a single 2D unit vector `dir` in the plane of the
+   table, PLUS which face is up (`face`: +1 front, -1 back). We draw the
+   arrow the viewer sees using `dir`.
+   A 180° flip about a diagonal is a reflection of the in-plane arrow across
+   that diagonal line, and it toggles which face is up. Reflecting a vector
+   across the line y=x swaps its (x,y). Reflecting across y=-x swaps AND
+   negates. That is exactly what physically happens, so the model is correct.
+
+   We label directions Up/Down/Left/Right for kids. */
+
+const DIRS = { up:[0,-1], down:[0,1], left:[-1,0], right:[1,0] };
+const NAME = { '0,-1':'UP ⬆️', '0,1':'DOWN ⬇️', '-1,0':'LEFT ⬅️', '1,0':'RIGHT ➡️' };
+function key(v){ return v[0]+','+v[1]; }
+function dirName(v){ return NAME[key(v)] || '?'; }
+
+// Reflect vector across the "↖↘" diagonal (line y=x): swap x,y.
+function flipNW_SE(v){ return [v[1], v[0]]; }
+// Reflect vector across the "↗↙" diagonal (line y=-x): swap and negate.
+function flipNE_SW(v){ return [-v[1], -v[0]]; }
+
+MM.game({
+  title: 'Magic Fortune Teller', emoji: '🔮',
+  ba: 'https://beastacademy.com/playground/fortune-teller',
+  rules: `
+    <p><b>The magic square knows which way to turn!</b> 🔮</p>
+    <p>There is an arrow on the tile. You can flip the tile over by holding two opposite corners and turning it — like flipping a pancake.</p>
+    <ul>
+      <li>Hold the <b>↖↘ corners</b> and flip: the arrow spins one way.</li>
+      <li>Hold the <b>↗↙ corners</b> and flip: the arrow spins the <b>other</b> way!</li>
+    </ul>
+    <p>Why? Turning something around different lines does different things. Flipping around a slanted line is like looking at the arrow in a mirror held along that line — and each slanted line gives a different mirror. That's the trick! 🪞</p>
+    <p>In the <b>Fortune game</b>, the crystal ball asks for a direction. Pick the right corners to flip so the arrow points that way, and you win a ⭐. Get a streak going!</p>`,
+  modes: [
+    { id: 'play', emoji: '🧪', name: 'Free Play', sub: 'Flip and explore' },
+    { id: 'fortune', emoji: '🔮', name: 'Fortune Game', sub: 'Guess the flip!' },
+  ],
+  onStart,
+});
+
+function onStart(mode, mount) {
+  const game = mode === 'fortune';
+  let dir = DIRS.up.slice();      // current arrow direction the viewer sees
+  let face = 1;                   // +1 front (yellow), -1 back (purple)
+  let busy = false;
+  let target = null;             // fortune target direction
+  let streak = MM.load('ft_streak', 0);
+
+  const size = Math.min(300, window.innerWidth - 90);
+
+  const panel = MM.el('div', { class: 'mm-panel mm-center mm-bounce-in' });
+
+  // ---- the 3D tile (CSS flip) ----
+  const scene = MM.el('div', { style: {
+    perspective: '900px', width: size + 'px', height: size + 'px',
+    margin: '6px auto 4px', touchAction: 'manipulation'
+  } });
+  const tile = MM.el('div', { style: {
+    position: 'relative', width: '100%', height: '100%',
+    transformStyle: 'preserve-3d', transition: 'transform .7s cubic-bezier(.3,1.2,.4,1)',
+    transform: 'rotateX(0deg)'
+  } });
+  scene.appendChild(tile);
+
+  // We draw the arrow with an SVG that we regenerate each render.
+  const frontFace = faceEl('#ffd23f', '#ff9f1c');
+  const backFace  = faceEl('#8338ec', '#5f26b0', true);
+  tile.append(frontFace.el, backFace.el);
+
+  function faceEl(bg, border, isBack) {
+    const el = MM.el('div', { style: {
+      position: 'absolute', inset: '0', borderRadius: '20px',
+      background: bg, border: '6px solid ' + border, boxSizing: 'border-box',
+      backfaceVisibility: 'hidden', display: 'flex', alignItems: 'center', justifyContent: 'center',
+      transform: isBack ? 'rotateX(180deg)' : 'none', boxShadow: '0 10px 24px rgba(34,34,59,.25)'
+    } });
+    // corner dots so kids can see the "handles"
+    const corners = [['-14px','-14px','↖'],['-14px','','↗'],['','-14px','↙'],['','','↘']];
+    corners.forEach(([t,l,ch]) => {
+      const c = MM.el('div', { style: {
+        position:'absolute',
+        top: t || 'auto', left: l || 'auto',
+        bottom: t ? 'auto':'-14px', right: l ? 'auto':'-14px',
+        width:'30px', height:'30px', borderRadius:'50%',
+        background:'#fff', border:'4px solid '+border, display:'flex',
+        alignItems:'center', justifyContent:'center', fontSize:'15px', fontWeight:'800'
+      } }, ch);
+      el.appendChild(c);
+    });
+    const svgWrap = MM.el('div', { style: { width:'70%', height:'70%' } });
+    el.appendChild(svgWrap);
+    return { el, svg: svgWrap };
+  }
+
+  function arrowSVG(vec, color) {
+    // an arrow pointing in direction vec (screen coords: +y down)
+    const ang = Math.atan2(vec[1], vec[0]) * 180 / Math.PI; // 0 = right
+    return `<svg viewBox="0 0 100 100" style="width:100%;height:100%;transform:rotate(${ang}deg);transition:transform .3s">
+      <g fill="${color}" stroke="${color}" stroke-width="10" stroke-linejoin="round" stroke-linecap="round">
+        <line x1="14" y1="50" x2="72" y2="50"/>
+        <polygon points="66,30 92,50 66,70"/>
+      </g></svg>`;
+  }
+
+  function render() {
+    // front shows `dir`; back shows the mirror (what's physically on the other side).
+    // Physically the back arrow, when the front shows `dir`, is `dir` reflected
+    // left-right (because you're seeing through) — but since only the visible
+    // face matters to the kid, we simply draw `dir` on whichever face is up and
+    // a faded arrow on the hidden one. The 3D flip handles the reveal.
+    frontFace.svg.innerHTML = arrowSVG(dir, '#c1121f');
+    backFace.svg.innerHTML  = arrowSVG(dir, '#ffe066');
+    tile.style.transform = face === 1 ? 'rotateX(0deg)' : 'rotateX(180deg)';
+    statusLine();
+  }
+
+  function statusLine() {
+    if (game) {
+      MM.status(`<span class="chip" style="background:#8338ec">⭐ Streak: ${streak}</span>`);
+    } else {
+      MM.status(`<span class="chip" style="background:#3a86ff">Arrow points ${dirName(dir)}</span>`);
+    }
+  }
+
+  panel.appendChild(scene);
+
+  // caption / prompt
+  const caption = MM.el('div', { class: 'mm-hint', style: { fontSize:'17px', fontWeight:'800', minHeight:'1.4em', color:'#8338ec' } });
+  panel.appendChild(caption);
+
+  // ---- flip buttons ----
+  const btnNW = MM.el('button', { class:'mm-btn blue', style:{ minHeight:'54px', fontSize:'17px' } }, '↖↘ Flip these corners');
+  const btnNE = MM.el('button', { class:'mm-btn pink', style:{ minHeight:'54px', fontSize:'17px' } }, '↗↙ Flip these corners');
+  const row1 = MM.el('div', { class:'mm-row', style:{ marginTop:'12px' } }, btnNW, btnNE);
+  panel.appendChild(row1);
+
+  const btnReset = MM.el('button', { class:'mm-btn ghost', style:{ minHeight:'48px' } }, '🔄 Reset');
+  const row2 = MM.el('div', { class:'mm-row', style:{ marginTop:'10px' } }, btnReset);
+  panel.appendChild(row2);
+
+  mount.appendChild(panel);
+
+  async function doFlip(which) {
+    if (busy) return; busy = true;
+    MM.sound.play('swoosh');
+    // apply the correct reflection to the arrow, and toggle the face
+    const before = dir.slice();
+    dir = which === 'NW' ? flipNW_SE(dir) : flipNE_SW(dir);
+    face = -face;
+    // animate: use an intermediate axis so the flip visibly tumbles about a diagonal
+    const axis = which === 'NW' ? '1,1,0' : '1,-1,0';
+    tile.style.transition = 'transform .7s cubic-bezier(.3,1.15,.4,1)';
+    // rotate 180° about the chosen diagonal axis
+    const cur = face === 1 ? 0 : 180;  // we still keep an X-based rest pose
+    tile.style.transform = `rotate3d(${axis},180deg) rotateX(${cur}deg)`;
+    // regenerate arrows mid-flip so the new orientation is visible on landing
+    await MM.sleep(360);
+    frontFace.svg.innerHTML = arrowSVG(dir, '#c1121f');
+    backFace.svg.innerHTML  = arrowSVG(dir, '#ffe066');
+    await MM.sleep(360);
+    // settle to a clean rest transform
+    tile.style.transition = 'transform .2s ease';
+    tile.style.transform = face === 1 ? 'rotateX(0deg)' : 'rotateX(180deg)';
+    MM.sound.play('place');
+    busy = false;
+    render();
+    if (game) checkFortune();
+    else caption.innerHTML = `Flipped the <b>${which==='NW'?'↖↘':'↗↙'}</b> corners → arrow now points <b>${dirName(dir)}</b>`;
+  }
+
+  btnNW.addEventListener('click', () => doFlip('NW'));
+  btnNE.addEventListener('click', () => doFlip('NE'));
+  btnReset.addEventListener('click', () => {
+    if (busy) return;
+    MM.sound.play('click');
+    dir = DIRS.up.slice(); face = 1; render();
+    if (game) newFortune(); else caption.textContent = 'Pick a pair of corners and flip! 🪄';
+  });
+
+  // ---- fortune mini-game ----
+  function newFortune() {
+    // choose a target reachable in exactly ONE flip from UP, so the puzzle is fair for age 5.
+    // From UP: NW-flip -> LEFT ; NE-flip -> RIGHT.  (both are single-flip goals)
+    dir = DIRS.up.slice(); face = 1;
+    const opts = ['left', 'right'];
+    const t = MM.choice(opts);
+    target = DIRS[t].slice();
+    render();
+    caption.innerHTML = `🔮 Make the arrow point <b>${dirName(target)}</b> with ONE flip!`;
+    MM.sound.play('deal');
+  }
+  function checkFortune() {
+    if (!target) return;
+    if (key(dir) === key(target)) {
+      streak++; MM.store('ft_streak', streak);
+      MM.sound.play('star');
+      caption.innerHTML = `✨ <b>Correct!</b> The arrow points ${dirName(dir)}. Streak: ${streak} ⭐`;
+      MM.confetti({ count: streak >= 5 ? 160 : 90 });
+      if (streak > 0 && streak % 5 === 0) {
+        MM.win({ title: `${streak} in a row!`, emoji: '🔮', sub: 'You cracked the magic square!', onAgain: () => { newFortune(); } });
+      } else {
+        setTimeout(newFortune, 1300);
+      }
+    } else {
+      MM.sound.play('wrong');
+      streak = 0; MM.store('ft_streak', 0);
+      caption.innerHTML = `Oops — that points ${dirName(dir)}. Try the other corners! (Streak reset)`;
+      statusLine();
+      setTimeout(() => { dir = DIRS.up.slice(); face = 1; render(); }, 1000);
+    }
+  }
+
+  render();
+  if (game) newFortune();
+  else caption.textContent = 'Pick a pair of corners and flip! 🪄';
+}
+</script>
+</body>
+</html>

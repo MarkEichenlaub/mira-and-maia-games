@@ -1,0 +1,372 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Pick Your Pony</title>
+<link rel="stylesheet" href="../../assets/common.css">
+</head>
+<body>
+<script src="../../assets/common.js"></script>
+<script>
+/* PICK YOUR PONY — dice-sum horse race.
+   Lanes 2–12. Roll two dice, add them, the pony on that lane trots forward.
+   Each player picks 3 lanes (may double up). First pony to the finish wins.
+   Teaches dice-sum probability: 7 is most common, 2 and 12 are rare. */
+
+const BLUE = '#3a86ff', RED = '#ff5a5f', GREEN = '#2ec4b6', YELLOW = '#ffd23f', PURPLE = '#8338ec';
+const LANES = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+const FINISH = 6;        // spaces to cross the line
+const PICKS = 3;         // ponies per player
+
+// number of dice combos that make each sum (weights for the AI)
+const WEIGHT = { 2:1, 3:2, 4:3, 5:4, 6:5, 7:6, 8:5, 9:4, 10:3, 11:2, 12:1 };
+
+MM.game({
+  title: 'Pick Your Pony', emoji: '🐎',
+  ba: 'https://beastacademy.com/playground/pick-your-pony',
+  rules: `
+    <p><b>Which pony will win the race?</b> The track has lanes numbered <b>2 to 12</b>.</p>
+    <ol>
+      <li>Each player picks <b>3 ponies</b> by tapping lane numbers (you can pick the same number twice!).</li>
+      <li>We roll <b>two dice</b> and add them. The pony on that lane number <b>gallops forward</b> one space. 🐎</li>
+      <li>The first pony to cross the <b>finish line</b> wins for its owner! 🏁</li>
+    </ol>
+    <p><b>Secret:</b> two dice add up to <b>7</b> more than any other number, and <b>2</b> or <b>12</b> almost never happen. Pick wisely!</p>`,
+  modes: [
+    { id: 'ai',   emoji: '🤖', name: 'Vs Computer', sub: 'Pick 3, then race!' },
+    { id: 'two',  emoji: '🧑‍🤝‍🧑', name: '2 Players', sub: 'Both pick & race' },
+    { id: 'solo', emoji: '⭐', name: 'Solo', sub: 'Pick 3 & watch' },
+  ],
+  onStart,
+});
+
+function onStart(mode, mount) {
+  const vsAI = mode === 'ai';
+  const solo = mode === 'solo';
+  const twoP = mode === 'two';
+
+  // picks[player] = array of lane numbers (length up to PICKS)
+  const picks = { 1: [], 2: [] };
+  // pos keyed by "player:lane" -> spaces advanced
+  const pos = {};
+  let phase = 'pick';   // 'pick' -> 'race' -> 'done'
+  let pickingPlayer = 1;
+  let busy = false;
+  let over = false;
+
+  const colorOf = p => p === 1 ? BLUE : RED;
+  function nameOf(p) {
+    if (vsAI) return p === 1 ? 'You' : 'Computer';
+    if (twoP) return 'Player ' + p;
+    return 'You';
+  }
+
+  const panel = MM.el('div', { class: 'mm-panel mm-center mm-bounce-in' });
+  mount.appendChild(panel);
+
+  // ---------------- PICK PHASE ----------------
+  function renderPick() {
+    phase = 'pick';
+    panel.innerHTML = '';
+    const p = pickingPlayer;
+    const remaining = PICKS - picks[p].length;
+
+    const title = MM.el('h2', { style: { margin: '2px 0 4px', color: colorOf(p) } },
+      (vsAI && p === 2) ? '🤖 Computer is picking…' : (nameOf(p) + ', pick your ' + PICKS + ' ponies!'));
+    const sub = MM.el('div', { class: 'mm-hint' },
+      'Tap lane numbers below. You have ' + remaining + ' pony' + (remaining === 1 ? '' : ' picks') + ' left. (You can double up!)');
+    panel.append(title, sub);
+
+    // chosen chips
+    const chosen = MM.el('div', { class: 'mm-row', style: { minHeight: '40px', margin: '6px 0' } });
+    picks[p].forEach((ln, i) => {
+      chosen.appendChild(MM.el('button', {
+        class: 'mm-pill', 'aria-pressed': 'true',
+        style: { borderColor: colorOf(p), background: '#fff' },
+        onClick: () => { if (busy) return; picks[p].splice(i, 1); MM.sound.play('click'); renderPick(); },
+      }, '🐎 ' + ln + ' ✕'));
+    });
+    if (picks[p].length) panel.appendChild(chosen);
+
+    // lane number buttons — big tap targets
+    const grid = MM.el('div', {
+      style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(64px, 1fr))', gap: '10px', margin: '10px 0' },
+    });
+    LANES.forEach(ln => {
+      const count = picks[p].filter(x => x === ln).length;
+      const btn = MM.el('button', {
+        class: 'mm-btn',
+        style: {
+          fontSize: '22px', padding: '16px 0', minHeight: '58px',
+          background: count ? colorOf(p) : '#fff', color: count ? '#fff' : 'var(--ink)',
+          boxShadow: count ? 'var(--shadow)' : '0 4px 0 #e7e0d0',
+          position: 'relative',
+        },
+        onClick: () => {
+          if (busy || picks[p].length >= PICKS) return;
+          MM.sound.play('pop'); picks[p].push(ln); afterPickTap();
+        },
+      }, String(ln));
+      if (count > 1) btn.appendChild(MM.el('span', {
+        style: { position: 'absolute', top: '2px', right: '6px', fontSize: '13px' } }, '×' + count));
+      grid.appendChild(btn);
+    });
+    panel.appendChild(grid);
+
+    // little probability hint bar
+    panel.appendChild(probHint());
+
+    if (picks[p].length >= PICKS) {
+      panel.appendChild(MM.el('button', {
+        class: 'mm-btn green', style: { fontSize: '20px', padding: '14px 28px', marginTop: '8px' },
+        onClick: () => { if (busy) return; MM.sound.play('ding'); nextPicker(); },
+      }, (needMorePickers() ? 'Next ▶' : '🏁 Start the race!')));
+    }
+
+    MM.status(`<span class="chip" style="background:${colorOf(p)}">${nameOf(p)} picking</span>`);
+  }
+
+  function afterPickTap() {
+    if (picks[pickingPlayer].length >= PICKS) renderPick();
+    else renderPick();
+  }
+
+  function probHint() {
+    const wrap = MM.el('div', { style: { margin: '8px auto 0', maxWidth: '440px' } });
+    wrap.appendChild(MM.el('div', { class: 'mm-hint', style: { marginBottom: '4px' } }, 'How likely is each sum?'));
+    const bars = MM.el('div', { style: { display: 'flex', alignItems: 'flex-end', gap: '4px', justifyContent: 'center', height: '54px' } });
+    LANES.forEach(ln => {
+      const h = 8 + WEIGHT[ln] * 7;
+      const col = MM.el('div', { style: {
+        display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '2px' } },
+        MM.el('div', { style: {
+          width: '18px', height: h + 'px', borderRadius: '5px 5px 0 0',
+          background: ln === 7 ? PURPLE : (WEIGHT[ln] >= 4 ? GREEN : '#c9c2d6') } }),
+        MM.el('div', { style: { fontSize: '11px', fontWeight: '800', color: 'var(--ink-soft)' } }, String(ln))
+      );
+      bars.appendChild(col);
+    });
+    wrap.appendChild(bars);
+    return wrap;
+  }
+
+  // who still needs to pick, and advancing between pickers / AI auto-pick
+  function needMorePickers() {
+    if (solo) return false;
+    // both players pick in ai and two modes
+    return pickingPlayer === 1;
+  }
+
+  function nextPicker() {
+    if (solo) { startRace(); return; }
+    if (pickingPlayer === 1) {
+      pickingPlayer = 2;
+      if (vsAI) { aiPick(); return; }
+      renderPick();
+    } else {
+      startRace();
+    }
+  }
+
+  function aiPick() {
+    // smart-ish bettor: weight toward high-prob sums (6,7,8), a little spread
+    busy = true;
+    renderPick(); // shows "Computer is picking…"
+    const pool = [];
+    LANES.forEach(ln => { for (let i = 0; i < WEIGHT[ln]; i++) pool.push(ln); });
+    const chosen = [];
+    // bias: force at least one of the strong middle numbers, then weighted random (no more than 2 same)
+    const strong = [7, 6, 8];
+    chosen.push(MM.choice(strong));
+    while (chosen.length < PICKS) {
+      const ln = MM.choice(pool);
+      if (chosen.filter(x => x === ln).length < 2) chosen.push(ln);
+    }
+    picks[2] = chosen;
+    setTimeout(() => { busy = false; startRace(); }, 700);
+  }
+
+  // ---------------- RACE PHASE ----------------
+  let trackWrap, dieA, dieB, lanesBox;
+
+  function racers() {
+    // list of {player, lane, key}
+    const list = [];
+    const players = solo ? [1] : [1, 2];
+    players.forEach(p => picks[p].forEach((ln, i) => {
+      const key = p + ':' + ln + ':' + i;
+      pos[key] = 0;
+      list.push({ player: p, lane: ln, key });
+    }));
+    return list;
+  }
+
+  let allRacers = [];
+
+  function startRace() {
+    phase = 'race';
+    over = false;
+    allRacers = racers();
+    renderTrack();
+    MM.status(`<span class="chip" style="background:${GREEN}">🏁 And they're off!</span>`);
+    setTimeout(raceLoop, 700);
+  }
+
+  function renderTrack() {
+    panel.innerHTML = '';
+    // dice display
+    const diceRow = MM.el('div', { style: { display: 'flex', gap: '14px', justifyContent: 'center', margin: '4px 0 10px', minHeight: '78px', alignItems: 'center' } });
+    dieA = MM.el('div', { class: 'mm-die' }); dieB = MM.el('div', { class: 'mm-die' });
+    { const d = MM.die(1); dieA.replaceChildren(...d.childNodes); }
+    { const d = MM.die(1); dieB.replaceChildren(...d.childNodes); }
+    const plus = MM.el('div', { style: { fontSize: '28px', fontWeight: '900', color: 'var(--ink-soft)' } }, '+');
+    diceRow.append(dieA, plus, dieB);
+    panel.appendChild(diceRow);
+
+    // legend of picks
+    if (!solo) {
+      const legend = MM.el('div', { class: 'mm-row', style: { marginBottom: '8px' } });
+      [1, 2].forEach(p => legend.appendChild(MM.el('div', { class: 'mm-score' },
+        MM.el('span', { class: 'dot', style: { background: colorOf(p) } }),
+        MM.el('span', {}, nameOf(p) + ': ' + picks[p].map(l => '🐎' + l).join('  '))
+      )));
+      panel.appendChild(legend);
+    }
+
+    // the track: one row per racer, ordered by lane then player
+    lanesBox = MM.el('div', { style: { display: 'flex', flexDirection: 'column', gap: '6px', margin: '6px 0' } });
+    allRacers
+      .slice()
+      .sort((a, b) => a.lane - b.lane || a.player - b.player)
+      .forEach(r => lanesBox.appendChild(laneRow(r)));
+    panel.appendChild(lanesBox);
+
+    panel.appendChild(MM.el('div', { class: 'mm-hint' }, 'Watch your ponies gallop toward the flag! 🏁'));
+  }
+
+  function laneRow(r) {
+    const cells = MM.el('div', { style: {
+      display: 'grid', gridTemplateColumns: `repeat(${FINISH + 1}, 1fr)`, gap: '2px', flex: '1',
+    } });
+    // build track cells; pony emoji placed at pos
+    for (let s = 0; s <= FINISH; s++) {
+      const isFinish = s === FINISH;
+      const cell = MM.el('div', {
+        'data-cell': r.key + '-' + s,
+        style: {
+          height: '30px', borderRadius: '7px',
+          background: isFinish ? YELLOW : (s % 2 ? '#f3eee2' : '#efeadb'),
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          fontSize: '20px', position: 'relative',
+        },
+      }, isFinish ? '🏁' : '');
+      cells.appendChild(cell);
+    }
+    const label = MM.el('div', {
+      style: {
+        width: '58px', flex: '0 0 58px', textAlign: 'center', fontWeight: '900',
+        fontSize: '18px', color: colorOf(r.player), display: 'flex',
+        alignItems: 'center', justifyContent: 'center', gap: '2px',
+      },
+    }, MM.el('span', { style: { fontSize: '13px' } }, String(r.lane)));
+    const row = MM.el('div', {
+      'data-lane': r.key,
+      style: { display: 'flex', alignItems: 'center', gap: '4px' },
+    }, label, cells);
+    placePony(row, r, 0);
+    return row;
+  }
+
+  function placePony(row, r, atPos) {
+    // clear pony from all cells in this row, then place at atPos
+    row.querySelectorAll('[data-cell]').forEach(c => {
+      const seg = c.getAttribute('data-cell');
+      const s = parseInt(seg.slice(seg.lastIndexOf('-') + 1), 10);
+      if (s === FINISH) { c.textContent = '🏁'; return; }
+      c.textContent = '';
+    });
+    const cell = row.querySelector(`[data-cell="${r.key}-${atPos}"]`);
+    if (cell) {
+      cell.textContent = r.player === 1 ? '🐎' : '🏇';
+      cell.style.transform = 'scale(1.25)';
+      setTimeout(() => { cell.style.transform = 'scale(1)'; }, 160);
+    }
+  }
+
+  function rowFor(key) { return lanesBox.querySelector(`[data-lane="${key}"]`); }
+
+  async function raceLoop() {
+    if (over) return;
+    busy = true;
+    // roll two dice
+    const [va, vb] = await Promise.all([MM.rollDie(dieA, 6), MM.rollDie(dieB, 6)]);
+    const sum = va + vb;
+    MM.sound.play('roll');
+    MM.status(`<span class="chip" style="background:${PURPLE}">🎲 ${va} + ${vb} = ${sum}!</span>`);
+    await MM.sleep(350);
+
+    // advance every racer on that lane
+    const movers = allRacers.filter(r => r.lane === sum);
+    if (movers.length) {
+      MM.sound.play('swoosh');
+      movers.forEach(r => {
+        pos[r.key] = Math.min(FINISH, pos[r.key] + 1);
+        const row = rowFor(r.key);
+        if (row) placePony(row, r, pos[r.key]);
+      });
+      await MM.sleep(250);
+    } else {
+      await MM.sleep(150);
+    }
+
+    // check for a winner (crossed finish)
+    const winners = allRacers.filter(r => pos[r.key] >= FINISH);
+    if (winners.length) { finish(winners); return; }
+
+    await MM.sleep(400);
+    raceLoop();
+  }
+
+  function finish(winners) {
+    over = true; phase = 'done';
+    // if multiple cross same roll, the first listed wins (tie-break by lane)
+    const w = winners[0];
+    const winPlayer = w.player;
+    if (solo) {
+      MM.status('');
+      MM.win({
+        title: 'Pony #' + w.lane + ' wins! 🏆',
+        emoji: '🐎',
+        sub: 'Your pony on lane ' + w.lane + ' crossed first!',
+        onAgain: () => MM.toMenu(),
+      });
+      return;
+    }
+    const youWin = vsAI && winPlayer === 1;
+    MM.status('');
+    if (vsAI) {
+      MM.win({
+        lose: !youWin,
+        title: youWin ? 'You win! 🎉' : 'Computer wins!',
+        emoji: youWin ? '🏆' : '🤖',
+        sub: (youWin ? 'Your' : 'The computer\'s') + ' pony on lane ' + w.lane + ' won the race!',
+        onAgain: () => MM.toMenu(),
+      });
+    } else {
+      MM.win({
+        title: nameOf(winPlayer) + ' wins! 🎉',
+        emoji: winPlayer === 1 ? '🐎' : '🏇',
+        sub: 'Pony on lane ' + w.lane + ' crossed the finish first!',
+        onAgain: () => MM.toMenu(),
+      });
+    }
+  }
+
+  // ---- kick off ----
+  pickingPlayer = 1;
+  renderPick();
+}
+</script>
+</body>
+</html>

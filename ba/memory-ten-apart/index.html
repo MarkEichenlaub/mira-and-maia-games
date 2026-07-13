@@ -1,0 +1,427 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Ten Apart</title>
+<link rel="stylesheet" href="../../assets/common.css">
+</head>
+<body>
+<script src="../../assets/common.js"></script>
+<script>
+/* TEN APART — memory game where a MATCH is two cards that differ by exactly 10
+   (e.g. 4 & 14, 7 & 17). Cards 1..20 make 10 pairs; a "smaller game" uses
+   1..5 & 11..15 (10 cards, 5 pairs) for little kids.
+   Same memory engine style as Memory Match: flip two, match → keep & go again,
+   else flip back & pass. Most pairs wins.
+   Modes: solo (best via MM.store), two (pass & play), ai (imperfect memory). */
+
+const HEX = { 1: '#3a86ff', 2: '#ff5a5f' };
+// Color a card by its "ones digit family" so 4 and 14 feel related.
+const FAMILY = ['#ff5a5f', '#ff9f1c', '#ffd23f', '#2ec4b6', '#3a86ff',
+                '#8338ec', '#ff70a6', '#ff9f1c', '#2ec4b6', '#3a86ff'];
+function faceColor(v) { return FAMILY[v % 10]; }
+// A friendly emoji hint that a low card and its +10 partner belong together.
+const EMOJI = ['🐣', '🐤', '🐥', '🐦', '🦆', '🦅', '🦉', '🦜', '🐧', '🕊️'];
+function faceEmoji(v) { return EMOJI[v % 10]; }
+
+MM.game({
+  title: 'Ten Apart', emoji: '🔟',
+  ba: 'https://beastacademy.com/playground/memory-ten-apart',
+  rules: `
+    <p><b>Find the ten-apart pairs!</b> All the cards start face down. On your turn, flip <b>two</b> cards. 🃏🃏</p>
+    <ol>
+      <li>Two cards match when they are <b>exactly 10 apart</b> — like <b>4 &amp; 14</b> or <b>7 &amp; 17</b>. ➕🔟</li>
+      <li>If they match, keep them and go again! 🎉</li>
+      <li>If not, flip them back and it's the next turn.</li>
+      <li>Whoever collects the <b>most pairs</b> wins! 🏆</li>
+    </ol>
+    <p>Turn on the <b>Smaller game</b> pill for littler kids — it uses just 1–5 and 11–15.</p>
+    <p>Tip: a card and its partner always have the <b>same last digit</b> (4 → 14). Great counting practice!</p>`,
+  modes: [
+    { id: 'solo', emoji: '🧒', name: 'Just Me', sub: 'Find all the pairs' },
+    { id: 'two',  emoji: '🧑‍🤝‍🧑', name: '2 Players', sub: 'Pass & play' },
+    { id: 'ai',   emoji: '🤖', name: 'Vs Computer', sub: 'Beat the robot' },
+  ],
+  onStart,
+});
+
+function onStart(mode, mount) {
+  const isSolo = mode === 'solo';
+  const isAI = mode === 'ai';
+
+  // Options.
+  let smaller = MM.load('mm-ten-small', false); // small = 1..5 & 11..15 (5 pairs)
+  let aiSmart = MM.load('mm-ten-aismart', false);
+
+  // State.
+  let cards = [];
+  let flipped = [];
+  let turn = 1;
+  let busy = false;
+  let moves = 0;
+  let matched = 0;
+  let scores = { 1: 0, 2: 0 };
+  let aiMemory = {};
+
+  const panel = MM.el('div', { class: 'mm-panel mm-center mm-bounce-in' });
+  mount.appendChild(panel);
+
+  /* ---------------------------------------------------- setup screen */
+  function setupScreen() {
+    panel.innerHTML = '';
+    MM.status('<span class="chip" style="background:#ff9f1c">Set up your game</span>');
+    panel.appendChild(MM.el('h2', { class: 'mm-center', style: { marginTop: '4px' } }, '🔟 Get ready!'));
+
+    panel.appendChild(MM.el('div', { style: { fontWeight: '800', marginTop: '10px' } }, 'Game size'));
+    const sizeRow = MM.el('div', { class: 'mm-pills', style: { margin: '8px 0 4px' } });
+    [['big', '🔢 Big game (1–20)', false], ['small', '🐣 Smaller game (1–5 & 11–15)', true]].forEach(([id, txt, val]) => {
+      sizeRow.appendChild(MM.el('button', {
+        class: 'mm-pill', 'aria-pressed': String(val === smaller),
+        onClick: () => { MM.sound.play('click'); smaller = val; MM.store('mm-ten-small', val); setupScreen(); },
+      }, txt));
+    });
+    panel.appendChild(sizeRow);
+
+    if (isAI) {
+      panel.appendChild(MM.el('div', { style: { fontWeight: '800', marginTop: '14px' } }, 'Robot brain'));
+      const aiRow = MM.el('div', { class: 'mm-pills', style: { margin: '8px 0 4px' } });
+      [['easy', '😴 Easy', false], ['smart', '🧠 Smart', true]].forEach(([id, txt, val]) => {
+        aiRow.appendChild(MM.el('button', {
+          class: 'mm-pill', 'aria-pressed': String(val === aiSmart),
+          onClick: () => { MM.sound.play('click'); aiSmart = val; MM.store('mm-ten-aismart', val); setupScreen(); },
+        }, txt));
+      });
+      panel.appendChild(aiRow);
+      panel.appendChild(MM.el('div', { class: 'mm-hint' }, 'Easy: the robot is forgetful. Smart: it remembers a lot!'));
+    }
+
+    if (isSolo) {
+      const best = MM.load(bestKey(), null);
+      if (best != null) panel.appendChild(MM.el('div', { class: 'mm-hint', style: { marginTop: '10px' } },
+        '🏅 Best for this game: ' + best + ' moves'));
+    }
+
+    panel.appendChild(MM.el('div', { class: 'mm-row' },
+      MM.el('button', {
+        class: 'mm-btn green', style: { fontSize: '20px', padding: '14px 30px', minHeight: '54px', marginTop: '14px' },
+        onClick: () => { MM.sound.play('pop'); newGame(); },
+      }, '▶️ Start!')));
+  }
+
+  function bestKey() { return 'ten-best-' + (smaller ? 'small' : 'big'); }
+
+  /* ---------------------------------------------------- deck */
+  function makeValues() {
+    // Each low card L pairs with L+10.
+    const lows = smaller ? [1, 2, 3, 4, 5] : [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+    const out = [];
+    lows.forEach(L => { out.push(L, L + 10); });
+    return out; // e.g. big => 20 cards, 10 pairs
+  }
+  function isPair(a, b) { return Math.abs(a - b) === 10; }
+
+  /* ---------------------------------------------------- new game */
+  function newGame() {
+    const values = MM.shuffle(makeValues());
+    cards = values.map(v => ({ value: v, owner: 0, flipped: false, el: null, faceEl: null }));
+    flipped = [];
+    turn = 1; busy = false; moves = 0; matched = 0;
+    scores = { 1: 0, 2: 0 };
+    aiMemory = {};
+
+    const cols = smaller ? 5 : 5; // 5 columns keeps rows short on phones
+    render(cols);
+    updateStatus();
+    if (isAI && turn === 2) setTimeout(aiTurn, 700);
+  }
+
+  /* ---------------------------------------------------- render */
+  function render(cols) {
+    panel.innerHTML = '';
+    panel.appendChild(isSolo ? scorebarSolo() : scorebarVs());
+
+    const stageW = Math.min(880, window.innerWidth - 28);
+    const gap = 10;
+    let cell = Math.floor((stageW - gap * (cols - 1)) / cols);
+    cell = Math.max(56, Math.min(cell, 120));
+    const face = Math.round(cell * 0.5);
+
+    const grid = MM.el('div', {
+      style: {
+        display: 'grid', gridTemplateColumns: 'repeat(' + cols + ', ' + cell + 'px)',
+        gap: gap + 'px', justifyContent: 'center', margin: '10px auto',
+      },
+    });
+
+    cards.forEach((card, i) => {
+      const el = MM.el('div', {
+        style: {
+          width: cell + 'px', height: Math.round(cell * 1.28) + 'px',
+          borderRadius: '14px', cursor: 'pointer', position: 'relative',
+          transition: 'transform .15s ease',
+        },
+        onClick: () => onCardClick(i),
+      });
+      const faceEl = MM.el('div', {
+        style: {
+          width: '100%', height: '100%', borderRadius: '14px',
+          display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
+          fontWeight: '800', boxShadow: '0 5px 0 rgba(0,0,0,.14)', fontSize: face + 'px', lineHeight: '1',
+        },
+      });
+      el.appendChild(faceEl);
+      card.el = el; card.faceEl = faceEl;
+      paintCard(card, face);
+      grid.appendChild(el);
+    });
+    panel.appendChild(grid);
+
+    if (isSolo) panel.appendChild(MM.el('div', { class: 'mm-hint' }, 'Flip two cards that are 10 apart (like 4 and 14)!'));
+    panel._faceSize = face;
+  }
+
+  function paintCard(card, face) {
+    const el = card.el, f = card.faceEl, col = faceColor(card.value);
+    if (card.owner) {
+      f.style.background = '#eef1f7';
+      f.style.color = col;
+      f.style.boxShadow = 'inset 0 0 0 4px ' + HEX[card.owner];
+      f.style.opacity = '.55';
+      f.innerHTML = '';
+      f.appendChild(MM.el('div', { style: { fontSize: Math.round(face * 0.6) + 'px' } }, faceEmoji(card.value)));
+      f.appendChild(MM.el('div', { style: { fontSize: Math.round(face * 0.85) + 'px' } }, String(card.value)));
+      el.style.cursor = 'default';
+    } else if (card.flipped) {
+      f.style.background = '#fff';
+      f.style.color = col;
+      f.style.boxShadow = '0 5px 0 rgba(0,0,0,.14), inset 0 0 0 4px ' + col;
+      f.style.opacity = '1';
+      f.innerHTML = '';
+      f.appendChild(MM.el('div', { style: { fontSize: Math.round(face * 0.6) + 'px' } }, faceEmoji(card.value)));
+      f.appendChild(MM.el('div', { style: { fontSize: Math.round(face * 0.95) + 'px' } }, String(card.value)));
+      el.style.cursor = 'default';
+    } else {
+      f.style.background = 'repeating-linear-gradient(45deg, #3a86ff, #3a86ff 9px, #2f74e0 9px, #2f74e0 18px)';
+      f.style.color = '#fff';
+      f.style.boxShadow = '0 5px 0 rgba(0,0,0,.18)';
+      f.style.opacity = '1';
+      f.innerHTML = '';
+      f.appendChild(MM.el('div', { style: { fontSize: Math.round(face * 0.9) + 'px' } }, '❔'));
+      el.style.cursor = 'pointer';
+    }
+  }
+
+  function scorebarSolo() {
+    return MM.el('div', { class: 'mm-scorebar' },
+      MM.el('div', { class: 'mm-score' }, MM.el('span', {}, '🔄 Moves: ' + moves)),
+      MM.el('div', { class: 'mm-score' }, MM.el('span', {}, '✨ Pairs: ' + matched + ' / ' + (cards.length / 2))));
+  }
+  function scorebarVs() {
+    const p1name = isAI ? '🧒 You' : '🧒 P1';
+    const p2name = isAI ? '🤖 Robot' : '🧒 P2';
+    return MM.el('div', { class: 'mm-scorebar' },
+      MM.el('div', { class: 'mm-score' + (turn === 1 ? ' active' : '') },
+        MM.el('span', { class: 'dot', style: { background: HEX[1] } }),
+        MM.el('span', {}, p1name + ': ' + scores[1])),
+      MM.el('div', { class: 'mm-score' + (turn === 2 ? ' active' : '') },
+        MM.el('span', { class: 'dot', style: { background: HEX[2] } }),
+        MM.el('span', {}, p2name + ': ' + scores[2])));
+  }
+  function refreshScorebar() {
+    panel.replaceChild(isSolo ? scorebarSolo() : scorebarVs(), panel.firstChild);
+  }
+
+  function updateStatus() {
+    if (isSolo) { MM.status('<span class="chip" style="background:' + HEX[1] + '">Find the pairs!</span>'); return; }
+    let who;
+    if (isAI) who = turn === 1 ? 'Your turn' : 'Robot thinking…';
+    else who = 'Player ' + turn + "'s turn";
+    MM.status('<span class="chip" style="background:' + HEX[turn] + '">' + who + '</span>');
+  }
+
+  /* ---------------------------------------------------- turns */
+  function canHumanClick() {
+    if (busy) return false;
+    if (isAI && turn === 2) return false;
+    return true;
+  }
+  function onCardClick(i) {
+    if (!canHumanClick()) return;
+    const card = cards[i];
+    if (card.owner || card.flipped) return;
+    if (flipped.length >= 2) return;
+    doFlip(i);
+  }
+  function doFlip(i) {
+    const card = cards[i];
+    card.flipped = true;
+    aiMemory[i] = card.value;
+    MM.sound.play('deal');
+    card.el.style.transform = 'scale(1.08)';
+    setTimeout(() => { if (card.el) card.el.style.transform = 'scale(1)'; }, 150);
+    paintCard(card, panel._faceSize);
+    flipped.push(i);
+    if (flipped.length === 2) { if (isSolo) moves++; resolvePair(); }
+  }
+
+  async function resolvePair() {
+    busy = true;
+    const [a, b] = flipped;
+    const va = cards[a].value, vb = cards[b].value;
+    const match = isPair(va, vb);
+    if (isSolo) refreshScorebar();
+    await MM.sleep(650);
+
+    if (match) {
+      MM.sound.play('ding');
+      const owner = isSolo ? 1 : turn;
+      cards[a].owner = owner; cards[b].owner = owner;
+      cards[a].flipped = false; cards[b].flipped = false;
+      paintCard(cards[a], panel._faceSize);
+      paintCard(cards[b], panel._faceSize);
+      matched++;
+      if (!isSolo) scores[turn]++;
+      cards[a].el.animate && cards[a].el.animate([{ transform: 'scale(1)' }, { transform: 'scale(1.18)' }, { transform: 'scale(1)' }], { duration: 380, easing: 'ease-out' });
+      cards[b].el.animate && cards[b].el.animate([{ transform: 'scale(1)' }, { transform: 'scale(1.18)' }, { transform: 'scale(1)' }], { duration: 380, easing: 'ease-out' });
+      delete aiMemory[a]; delete aiMemory[b];
+      // Show why it matched: smaller + 10 = bigger.
+      const lo = Math.min(va, vb), hi = Math.max(va, vb);
+      MM.status('<span class="chip" style="background:#2ec4b6">' + lo + ' + 10 = ' + hi + '! 🎉</span>');
+      setTimeout(updateStatus, 1300);
+      flipped = [];
+      MM.sound.play('star');
+      if (!isSolo) refreshScorebar();
+
+      if (matched === cards.length / 2) { busy = false; endGame(); return; }
+      busy = false;
+      if (isAI && turn === 2) setTimeout(aiTurn, 650);
+    } else {
+      MM.sound.play('wrong');
+      forgetChance(a); forgetChance(b);
+      await MM.sleep(350);
+      cards[a].flipped = false; cards[b].flipped = false;
+      paintCard(cards[a], panel._faceSize);
+      paintCard(cards[b], panel._faceSize);
+      flipped = [];
+      if (!isSolo) { turn = turn === 1 ? 2 : 1; refreshScorebar(); }
+      busy = false;
+      updateStatus();
+      if (isAI && turn === 2) setTimeout(aiTurn, 650);
+    }
+  }
+
+  /* ---------------------------------------------------- AI */
+  function forgetChance(i) {
+    if (!isAI) return;
+    const forget = aiSmart ? 0.15 : 0.6;
+    if (Math.random() < forget) delete aiMemory[i];
+  }
+  function unknownIndices() {
+    const out = [];
+    cards.forEach((c, i) => { if (!c.owner && !c.flipped && aiMemory[i] === undefined) out.push(i); });
+    return out;
+  }
+  function knownIndices() {
+    const out = [];
+    cards.forEach((c, i) => { if (!c.owner && aiMemory[i] !== undefined) out.push(i); });
+    return out;
+  }
+  function knownPair() {
+    const known = knownIndices();
+    for (let i = 0; i < known.length; i++)
+      for (let j = i + 1; j < known.length; j++)
+        if (isPair(aiMemory[known[i]], aiMemory[known[j]])) return [known[i], known[j]];
+    return null;
+  }
+  function knownPartnerFor(value, avoidIdx) {
+    for (const i of knownIndices()) {
+      if (i === avoidIdx) continue;
+      if (isPair(value, aiMemory[i])) return i;
+    }
+    return null;
+  }
+
+  async function aiTurn() {
+    if (turn !== 2 || busy) return;
+    busy = true;
+    updateStatus();
+
+    const pair = knownPair();
+    if (pair) {
+      await aiFlip(pair[0]);
+      await MM.sleep(500);
+      await aiFlip(pair[1]);
+      busy = false; resolveAfterAI(); return;
+    }
+
+    const unknown = unknownIndices();
+    let first;
+    if (unknown.length) first = MM.choice(unknown);
+    else { const k = knownIndices(); first = k.length ? MM.choice(k) : firstFree(); }
+    await aiFlip(first);
+    const firstVal = cards[first].value;
+    await MM.sleep(500);
+
+    const partner = knownPartnerFor(firstVal, first);
+    let second;
+    if (partner != null) second = partner;
+    else {
+      const rest = unknownIndices().filter(x => x !== first);
+      second = rest.length ? MM.choice(rest) : firstFree(first);
+    }
+    await aiFlip(second);
+    busy = false; resolveAfterAI();
+  }
+
+  function firstFree(avoid) {
+    for (let i = 0; i < cards.length; i++)
+      if (!cards[i].owner && !cards[i].flipped && i !== avoid) return i;
+    return -1;
+  }
+  function aiFlip(i) {
+    return new Promise(resolve => {
+      const card = cards[i];
+      if (!card || card.owner || card.flipped) { resolve(); return; }
+      card.flipped = true;
+      aiMemory[i] = card.value;
+      MM.sound.play('deal');
+      card.el.style.transform = 'scale(1.08)';
+      setTimeout(() => { if (card.el) card.el.style.transform = 'scale(1)'; }, 150);
+      paintCard(card, panel._faceSize);
+      flipped.push(i);
+      setTimeout(resolve, 180);
+    });
+  }
+  function resolveAfterAI() { if (flipped.length === 2) resolvePair(); }
+
+  /* ---------------------------------------------------- end */
+  function endGame() {
+    if (isSolo) {
+      const best = MM.load(bestKey(), null);
+      const isBest = best == null || moves < best;
+      if (isBest) MM.store(bestKey(), moves);
+      MM.win({ title: 'You found them all! 🎉', emoji: '🔟',
+        sub: 'You did it in ' + moves + ' moves.' + (isBest ? ' 🏅 New best!' : (' Best: ' + best)),
+        onAgain: () => MM.toMenu() });
+      return;
+    }
+    const p1 = scores[1], p2 = scores[2];
+    if (isAI) {
+      if (p1 > p2) MM.win({ title: 'You win! 🎉', emoji: '🏆', sub: 'Pairs — You ' + p1 + ' : ' + p2 + ' Robot', onAgain: () => MM.toMenu() });
+      else if (p2 > p1) MM.win({ lose: true, title: 'Robot wins!', emoji: '🤖', sub: 'Pairs — You ' + p1 + ' : ' + p2 + ' Robot. Try again!', onAgain: () => MM.toMenu() });
+      else MM.win({ title: "It's a tie! 🤝", emoji: '🤝', sub: 'Pairs — You ' + p1 + ' : ' + p2 + ' Robot', onAgain: () => MM.toMenu() });
+    } else {
+      if (p1 === p2) MM.win({ title: "It's a tie! 🤝", emoji: '🤝', sub: 'Both found ' + p1 + ' pairs!', onAgain: () => MM.toMenu() });
+      else {
+        const w = p1 > p2 ? 1 : 2;
+        MM.win({ title: 'Player ' + w + ' wins! 🎉', emoji: w === 1 ? '🔵' : '🔴', sub: 'Pairs — P1 ' + p1 + ' : ' + p2 + ' P2', onAgain: () => MM.toMenu() });
+      }
+    }
+  }
+
+  setupScreen();
+}
+</script>
+</body>
+</html>

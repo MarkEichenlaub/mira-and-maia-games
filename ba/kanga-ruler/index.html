@@ -1,0 +1,379 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Kanga-Ruler</title>
+<link rel="stylesheet" href="../../assets/common.css">
+</head>
+<body>
+<script src="../../assets/common.js"></script>
+<script>
+/* KANGA-RULER — hop along a number path 0–30, skip-counting by your dice roll.
+   Roll a die to get your hop size (1–6). Your kangaroo 🦘 hops that many at a
+   time, calling each landing spot out loud on screen: 0, +n, +n, ...
+   Reach or pass 30 to finish. Land EXACTLY on the highlighted "scepter" space
+   to become the Kanga-Ruler and get a silly hop rule + bonus.
+
+   Math: skip-counting / multiples. Each roll shows the multiples of n being
+   counted, highlighted along the path. */
+
+const PATH_END = 30;
+const HEX = { 1: '#3a86ff', 2: '#ff5a5f' };
+
+const SILLY_RULES = [
+  'Everyone must HOP like a bunny on their next turn! 🐰',
+  'Say "BOING!" out loud before your next roll! 🔊',
+  'Wiggle your ears — you are royalty now! 👂',
+  'Do a little kangaroo dance! 💃',
+  'Give a big royal wave! 👋',
+  'Everyone bows to the Kanga-Ruler! 🙇',
+  'Hop on one foot and count to 3! 🦵',
+  'Make your silliest kangaroo face! 😝',
+];
+
+MM.game({
+  title: 'Kanga-Ruler', emoji: '🦘',
+  ba: 'https://beastacademy.com/playground/kangaruler',
+  rules: `
+    <p><b>Hop along the number path!</b> 🦘 Roll the die to see how far you skip-count each hop.</p>
+    <ol>
+      <li>Tap <b>Roll</b> to get your hop size (1–6).</li>
+      <li>Your kangaroo hops that many spaces at a time — 0, then +n, +n… count along! 🔢</li>
+      <li>Land <b>exactly</b> on the golden 👑 <b>scepter space</b> to become the <b>Kanga-Ruler</b> and pick a silly rule!</li>
+      <li>Reach or pass <b>30</b> to finish the path. 🏁</li>
+    </ol>
+    <p>Skip-counting is just counting by the same number over and over — 3, 6, 9, 12… you've got this! 🌟</p>`,
+  modes: [
+    { id: 'solo', emoji: '⭐', name: 'Solo',       sub: 'Hop to the end & skip-count!' },
+    { id: 'two',  emoji: '🧑‍🤝‍🧑', name: '2 Players', sub: 'Race two kangaroos' },
+    { id: 'ai',   emoji: '🤖', name: 'Vs Computer', sub: 'Race the robot roo' },
+  ],
+  onStart,
+});
+
+function onStart(mode, mount) {
+  const vsAI = (mode === 'ai');
+  const solo = (mode === 'solo');
+  const twoP = (mode === 'two');
+  const nPlayers = solo ? 1 : 2;
+
+  function label(pl) { return solo ? 'You' : vsAI ? (pl === 1 ? 'You' : 'Computer') : ('Player ' + pl); }
+
+  const ROOS = { 1: '🦘', 2: '🦘' };
+  const players = {};
+  for (let i = 1; i <= nPlayers; i++) players[i] = { pos: 0, crowns: 0 };
+  let turn = 1;
+  let over = false;
+  let busy = false;
+  let scepter = MM.range(6, 27);        // the highlighted bonus space this round
+  const best = MM.load('kanga-best', null);   // solo: fewest rolls to reach end
+
+  const panel = MM.el('div', { class: 'mm-panel mm-center mm-bounce-in' });
+  mount.appendChild(panel);
+
+  /* ---------- winding path layout: snake rows ---------- */
+  function layout() {
+    const w = Math.max(300, Math.min(680, window.innerWidth - 36));
+    // choose columns so cells are a comfy tap size
+    const cols = w < 380 ? 5 : w < 520 ? 6 : 8;
+    const cell = Math.floor((w - (cols + 1) * 6) / cols);
+    const total = PATH_END + 1;                 // spaces 0..30
+    const rows = Math.ceil(total / cols);
+    const h = rows * (cell + 6) + 6;
+    return { w, h, cols, cell, rows, total };
+  }
+
+  // map space index -> {x,y} center, boustrophedon (snake) so it winds
+  function spaceXY(i, L) {
+    const row = Math.floor(i / L.cols);
+    let col = i % L.cols;
+    if (row % 2 === 1) col = L.cols - 1 - col;   // reverse odd rows
+    const x = 6 + col * (L.cell + 6) + L.cell / 2;
+    const y = 6 + row * (L.cell + 6) + L.cell / 2;
+    return { x, y };
+  }
+
+  const CELL_COLORS = ['#3a86ff', '#2ec4b6', '#ff9f1c', '#8338ec', '#ff70a6'];
+
+  function boardCanvas(L, hopSet, currentPos) {
+    // hopSet: Set of multiples to highlight; currentPos: {1:pos,2:pos}
+    const cv = MM.el('canvas', { width: L.w, height: L.h, style: { width: L.w + 'px', maxWidth: '100%', height: 'auto', borderRadius: '18px', background: 'linear-gradient(#eafff6,#f3f0ff)' } });
+    const g = cv.getContext('2d');
+    drawBoard(g, L, hopSet, currentPos);
+    return { cv, g };
+  }
+
+  function drawBoard(g, L, hopSet, currentPos) {
+    g.clearRect(0, 0, L.w, L.h);
+    // connectors
+    g.strokeStyle = '#cfc8e6'; g.lineWidth = 5; g.lineCap = 'round';
+    for (let i = 0; i < L.total - 1; i++) {
+      const a = spaceXY(i, L), b = spaceXY(i + 1, L);
+      g.beginPath(); g.moveTo(a.x, a.y); g.lineTo(b.x, b.y); g.stroke();
+    }
+    // spaces
+    for (let i = 0; i < L.total; i++) {
+      const p = spaceXY(i, L);
+      const isScepter = i === scepter;
+      const lit = hopSet && hopSet.has(i);
+      const r = L.cell / 2 - 2;
+      // base
+      g.beginPath(); g.arc(p.x, p.y, r, 0, 7);
+      if (i === 0) g.fillStyle = '#2ec4b6';
+      else if (i === PATH_END) g.fillStyle = '#ff5a5f';
+      else if (isScepter) g.fillStyle = '#ffd23f';
+      else if (lit) g.fillStyle = '#c9b8ff';
+      else g.fillStyle = '#ffffff';
+      g.fill();
+      g.lineWidth = lit ? 5 : 3;
+      g.strokeStyle = lit ? '#8338ec' : (isScepter ? '#ff9f1c' : '#e3ddf2');
+      g.stroke();
+      // number
+      g.fillStyle = (i === 0 || i === PATH_END) ? '#fff' : '#2b2440';
+      g.font = '800 ' + Math.max(12, Math.floor(L.cell * 0.34)) + 'px system-ui, sans-serif';
+      g.textAlign = 'center'; g.textBaseline = 'middle';
+      g.fillText(String(i), p.x, p.y + 1);
+      // markers
+      if (i === 0) { g.font = Math.floor(L.cell * 0.4) + 'px serif'; g.fillText('🏁', p.x, p.y - r * 0.55); }
+      if (i === PATH_END) { g.font = Math.floor(L.cell * 0.4) + 'px serif'; g.fillText('🏆', p.x, p.y - r * 0.55); }
+      if (isScepter) { g.font = Math.floor(L.cell * 0.44) + 'px serif'; g.fillText('👑', p.x, p.y - r * 0.6); }
+    }
+    // kangaroos
+    for (let pl = 1; pl <= nPlayers; pl++) {
+      const p = spaceXY(Math.min(currentPos[pl], PATH_END), L);
+      g.font = Math.floor(L.cell * 0.72) + 'px serif';
+      const off = nPlayers > 1 ? (pl === 1 ? -L.cell * 0.16 : L.cell * 0.16) : 0;
+      // colored ground shadow to tell roos apart
+      g.beginPath(); g.arc(p.x + off, p.y + L.cell * 0.28, L.cell * 0.18, 0, 7);
+      g.fillStyle = HEX[pl] + 'cc'; g.fill();
+      g.fillText('🦘', p.x + off, p.y - L.cell * 0.02);
+    }
+  }
+
+  /* ---------- scoreboard ---------- */
+  function scorebar() {
+    if (solo) {
+      return MM.el('div', { class: 'mm-scorebar' },
+        MM.el('div', { class: 'mm-score' }, '📍 At: ' + players[1].pos),
+        MM.el('div', { class: 'mm-score' }, '👑 Crowns: ' + players[1].crowns),
+        MM.el('div', { class: 'mm-score' }, '🎲 Rolls: ' + rolls),
+        best != null ? MM.el('div', { class: 'mm-score' }, '⭐ Best: ' + best) : null,
+      );
+    }
+    return MM.el('div', { class: 'mm-scorebar' },
+      [1, 2].map(pl => MM.el('div', { class: 'mm-score' + (pl === turn && !over ? ' active' : '') },
+        MM.el('span', { class: 'dot', style: { background: HEX[pl] } }),
+        MM.el('span', {}, label(pl) + ': ' + players[pl].pos + ' 👑' + players[pl].crowns))));
+  }
+
+  let rolls = 0;   // solo roll counter
+
+  /* ---------- render a turn ---------- */
+  function render(hopSet, countLine) {
+    panel.innerHTML = '';
+    panel.appendChild(scorebar());
+    if (!over) MM.status('<span class="chip" style="background:' + HEX[turn] + '">' +
+      (vsAI && turn === 2 ? 'Robot roo hops…' : label(turn) + "'s turn") + '</span>');
+    const L = layout();
+    const { cv } = boardCanvas(L, hopSet, posMap());
+    panel.appendChild(cv);
+    // count-aloud line
+    const cl = MM.el('div', { style: { fontSize: '22px', fontWeight: '800', margin: '10px 0 4px', minHeight: '1.5em', color: HEX[turn] } }, countLine || '');
+    panel.appendChild(cl);
+    return { L, cv, cl };
+  }
+
+  function posMap() { const m = {}; for (let i = 1; i <= nPlayers; i++) m[i] = players[i].pos; return m; }
+
+  /* ---------- the roll + hop sequence ---------- */
+  function turnScreen() {
+    if (over) return;
+    const { cl } = render(null, 'Roll the die to see your hop size!');
+
+    // die + roll button row
+    const dieBox = MM.el('div', { style: { display: 'flex', justifyContent: 'center', margin: '4px 0' } }, MM.die(1));
+    panel.appendChild(dieBox);
+    const dieEl = dieBox.firstChild;
+
+    const rollBtn = MM.el('button', {
+      class: 'mm-btn', style: { fontSize: '20px', padding: '14px 30px', minHeight: '56px', background: HEX[turn] },
+      onClick: () => doRoll(),
+    }, '🎲 Roll & hop!');
+    panel.appendChild(MM.el('div', { class: 'mm-row', style: { marginTop: '6px' } }, rollBtn));
+    panel.appendChild(MM.el('div', { class: 'mm-hint' }, 'Your kangaroo skip-counts by the number you roll. Count along out loud!'));
+
+    async function doRoll() {
+      if (busy) return;
+      busy = true; rollBtn.disabled = true;
+      const n = await MM.rollDie(dieEl, 6);
+      if (solo) rolls++;
+      await hopSequence(turn, n, cl);
+      busy = false;
+      afterHop(turn);
+    }
+
+    if (vsAI && turn === 2) {
+      rollBtn.disabled = true;
+      setTimeout(async () => {
+        if (over) return;
+        busy = true;
+        cl.textContent = 'The robot roo rolls…';
+        const n = await MM.rollDie(dieEl, 6);
+        await hopSequence(turn, n, cl);
+        busy = false;
+        afterHop(turn);
+      }, 600);
+    }
+  }
+
+  // animate the kangaroo hopping `n` at a time, counting each landing aloud.
+  async function hopSequence(pl, n, cl) {
+    const start = players[pl].pos;
+    // build the list of multiples-of-n landing spots for this hop set (from 0)
+    const hopSet = new Set();
+    for (let k = 0; k * n <= PATH_END; k++) hopSet.add(k * n);
+    // re-render with the multiples highlighted
+    const L = layout();
+    const board = boardCanvas(L, hopSet, posMap());
+    panel.replaceChild(board.cv, panel.querySelector('canvas'));
+
+    cl.innerHTML = 'Skip-counting by <b>' + n + '</b>: ' + start;
+    MM.sound.play('pop');
+    await MM.sleep(450);
+
+    // For a 5-year-old: ONE die roll = ONE hop of size n (simple + faithful to
+    // "hop by your roll"). But we narrate the running skip-count so far.
+    let pos = start + n;
+    if (pos > PATH_END) pos = PATH_END;
+    // animate a little arc between start and pos
+    await animateHop(pl, start, pos, board.g, L, hopSet);
+    players[pl].pos = pos;
+
+    // count-aloud text: show the full skip-count chain up to current pos
+    const chain = [];
+    for (let v = 0; v <= players[pl].pos; v += n) chain.push(v);
+    if (chain[chain.length - 1] !== players[pl].pos) chain.push(players[pl].pos);
+    cl.innerHTML = 'Count by ' + n + ': <b>' + chain.join(', ') + '</b>';
+    MM.sound.play('place');
+    await MM.sleep(500);
+  }
+
+  // one hop with a parabolic arc, redrawing the board each frame
+  function animateHop(pl, from, to, g, L, hopSet) {
+    return new Promise(res => {
+      const a = spaceXY(from, L), b = spaceXY(to, L);
+      const dur = 520, t0 = performance.now();
+      MM.sound.play('roll');
+      function frame(ts) {
+        const t = Math.min(1, (ts - t0) / dur);
+        const x = a.x + (b.x - a.x) * t;
+        const baseY = a.y + (b.y - a.y) * t;
+        const arc = -Math.sin(t * Math.PI) * (L.cell * 0.9);
+        const y = baseY + arc;
+        // redraw board with static roos except the hopping one
+        const staticPos = posMap();
+        drawBoard(g, L, hopSet, staticPos);
+        // draw the hopping roo on top at (x,y)
+        g.font = Math.floor(L.cell * 0.72) + 'px serif';
+        g.textAlign = 'center'; g.textBaseline = 'middle';
+        g.beginPath(); g.arc(x, y + L.cell * 0.28, L.cell * 0.18, 0, 7);
+        g.fillStyle = HEX[pl] + 'cc'; g.fill();
+        g.fillText('🦘', x, y);
+        if (t < 1) requestAnimationFrame(frame);
+        else res();
+      }
+      requestAnimationFrame(frame);
+    });
+  }
+
+  /* ---------- after a hop: scepter check, win check, next turn ---------- */
+  function afterHop(pl) {
+    const p = players[pl];
+    // landed exactly on scepter?
+    if (p.pos === scepter && p.pos !== PATH_END) {
+      p.crowns++;
+      MM.sound.play('star');
+      showScepterCard(pl);
+      return;
+    }
+    // reached / passed the end?
+    if (p.pos >= PATH_END) { finish(pl); return; }
+    nextTurn();
+  }
+
+  function showScepterCard(pl) {
+    const rule = MM.choice(SILLY_RULES);
+    MM.confetti({ count: 60 });
+    render(null, '');
+    const card = MM.el('div', {
+      class: 'mm-panel', style: { border: '5px solid var(--c-yellow)', maxWidth: '420px', margin: '10px auto', background: '#fffbe9' },
+    },
+      MM.el('div', { style: { fontSize: '58px' } }, '👑'),
+      MM.el('h2', { style: { margin: '4px 0', color: '#8338ec' } }, label(pl) + ' is the Kanga-Ruler!'),
+      MM.el('div', { style: { fontSize: '18px', fontWeight: '800', margin: '6px 0' } }, 'Landed exactly on ' + scepter + '! 🎯'),
+      MM.el('div', { style: { fontSize: '20px', fontWeight: '800', margin: '10px 0', color: '#2b2440' } },
+        'Kanga-Ruler says:'),
+      MM.el('div', { style: { fontSize: '20px', margin: '2px 0 12px' } }, rule),
+      MM.el('div', { class: 'mm-row' },
+        bigBtn('👑 Take the crown!', '#8338ec', () => {
+          MM.sound.play('pop');
+          // pick a new scepter space ahead for variety
+          scepter = MM.range(Math.min(PATH_END - 3, players[pl].pos + 2), PATH_END - 1);
+          if (players[pl].pos >= PATH_END) { finish(pl); return; }
+          nextTurn();
+        })));
+    panel.appendChild(card);
+  }
+
+  function nextTurn() {
+    if (over) return;
+    if (solo) { turnScreen(); return; }
+    turn = turn === 1 ? 2 : 1;
+    turnScreen();
+  }
+
+  /* ---------- finish ---------- */
+  function finish(winner) {
+    over = true;
+    render(null, '');
+    if (solo) {
+      let sub = 'You hopped to 30 in ' + rolls + ' rolls and earned ' + players[1].crowns + ' crown' + (players[1].crowns === 1 ? '' : 's') + '! 👑';
+      if (best == null || rolls < best) { MM.store('kanga-best', rolls); sub += ' 🌟 New best!'; }
+      else sub += ' (Best: ' + best + ')';
+      MM.win({ title: 'You reached the end! 🎉', emoji: '🦘', sub, onAgain: () => restart() });
+      return;
+    }
+    const c1 = players[1].crowns, c2 = players[2].crowns;
+    const crownNote = (c1 || c2) ? ' Crowns — ' + label(1) + ': ' + c1 + ', ' + label(2) + ': ' + c2 + ' 👑' : '';
+    if (vsAI) {
+      const youWin = winner === 1;
+      MM.win({ lose: !youWin, title: youWin ? 'You win the race! 🎉' : 'Robot roo wins!',
+        emoji: youWin ? '🏆' : '🤖', sub: label(winner) + ' hopped to 30 first!' + crownNote,
+        onAgain: () => restart() });
+      return;
+    }
+    MM.win({ title: label(winner) + ' wins the race! 🎉', emoji: winner === 1 ? '🔵' : '🔴',
+      sub: label(winner) + ' reached 30 first!' + crownNote, onAgain: () => restart() });
+  }
+
+  function restart() {
+    for (let i = 1; i <= nPlayers; i++) players[i] = { pos: 0, crowns: 0 };
+    turn = 1; over = false; busy = false; rolls = 0;
+    scepter = MM.range(6, 27);
+    turnScreen();
+  }
+
+  /* ---------- helpers ---------- */
+  function bigBtn(text, bg, onClick) {
+    return MM.el('button', {
+      class: 'mm-btn', style: { fontSize: '19px', padding: '13px 24px', minHeight: '54px', background: bg },
+      onClick: () => onClick(),
+    }, text);
+  }
+
+  turnScreen();
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,338 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Fox &amp; Hare</title>
+<link rel="stylesheet" href="../../assets/common.css">
+</head>
+<body>
+<script src="../../assets/common.js"></script>
+<script>
+/* FOX & HARE — chase game on a 3x3 grid of dots (orthogonal lines only).
+   Dots are numbered 0..8:
+       0 1 2
+       3 4 5
+       6 7 8
+   Fox 🦊 starts on 0 (top-left), Hare 🐰 starts on 8 (bottom-right).
+   FOX moves first, then they alternate. A move slides your piece along one line
+   to a neighbouring dot (up/down/left/right — no diagonals).
+   FOX WINS by landing on the hare's dot. HARE WINS if it survives 10 of its OWN
+   moves without being caught.
+
+   AI: PERFECT via minimax with memoization over the whole state space
+   (foxPos 0-8 × harePos 0-8 × whoseTurn × hareMovesLeft 0-10). The state count is
+   tiny so we solve it exactly — the AI fox catches whenever possible and the AI
+   hare evades whenever possible. */
+
+const HEX = { fox: '#ff9f1c', hare: '#3a86ff' };
+// orthogonal neighbours on the 3x3 grid
+const NBR = [
+  [1, 3],          // 0
+  [0, 2, 4],       // 1
+  [1, 5],          // 2
+  [0, 4, 6],       // 3
+  [1, 3, 5, 7],    // 4
+  [2, 4, 8],       // 5
+  [3, 7],          // 6
+  [4, 6, 8],       // 7
+  [5, 7],          // 8
+];
+const HARE_LIMIT = 10;   // hare needs to complete this many of its own moves
+
+MM.game({
+  title: 'Fox & Hare', emoji: '🦊',
+  ba: 'https://beastacademy.com/playground/fox-and-hare',
+  rules: `
+    <p><b>The fox chases the hare!</b> Nine dots are joined by lines. Slide your
+    animal along a line to a touching dot.</p>
+    <ol>
+      <li>🦊 <b>Fox</b> starts top-left; 🐰 <b>Hare</b> starts bottom-right.</li>
+      <li>The <b>Fox goes first</b>, then take turns. You can only move up, down,
+          left, or right along a line (no diagonals!).</li>
+      <li>🦊 <b>Fox wins</b> if it lands right on the hare — gotcha!</li>
+      <li>🐰 <b>Hare wins</b> if it makes <b>10 moves</b> without being caught.</li>
+    </ol>
+    <p><b>Tip:</b> the hare should keep dancing away and never get cornered!</p>`,
+  modes: [
+    { id: 'ai',  emoji: '🤖', name: 'Vs Computer', sub: 'Pick your animal' },
+    { id: 'two', emoji: '🧑‍🤝‍🧑', name: '2 Players', sub: 'Pass & play' },
+  ],
+  onStart,
+});
+
+/* ===================== PERFECT SOLVER (module-level, memoized) =====================
+   State key = fox*1000 + hare*100 + turn*10 + hareLeft, where turn 0=fox,1=hare.
+   value(state) returns +1 if FOX (the mover-independent "fox side") ultimately wins
+   with optimal play from both, -1 if HARE wins. Terminal:
+     - fox on hare's dot  -> fox wins (+1)
+     - hareLeft == 0 and not caught -> hare wins (-1)
+   Fox wants to MAXIMISE (reach +1); hare wants to MINIMISE (reach -1). */
+const _memo = new Map();
+function solve(fox, hare, turn, hareLeft) {
+  if (fox === hare) return 1;                 // fox caught hare
+  if (hareLeft === 0) return -1;              // hare survived its 10 moves
+  const key = fox * 1000 + hare * 100 + turn * 10 + hareLeft;
+  const hit = _memo.get(key);
+  if (hit !== undefined) return hit;
+  let val;
+  if (turn === 0) {
+    // fox to move; fox maximises
+    val = -1;
+    for (const nf of NBR[fox]) {
+      const r = solve(nf, hare, 1, hareLeft);
+      if (r > val) val = r;
+      if (val === 1) break;
+    }
+  } else {
+    // hare to move; hare minimises. Each hare move consumes one of its 10 moves.
+    val = 1;
+    for (const nh of NBR[hare]) {
+      // hare may not move onto the fox (that's suicide) — allowed by rules but never optimal;
+      // still, if hare moves onto fox it's caught immediately.
+      const r = (nh === fox) ? 1 : solve(fox, nh, 0, hareLeft - 1);
+      if (r < val) val = r;
+      if (val === -1) break;
+    }
+  }
+  _memo.set(key, val);
+  return val;
+}
+// Best move for the side to move under optimal play.
+function bestFoxMove(fox, hare, hareLeft) {
+  // prefer a move that wins; among wins prefer catching soonest is not tracked,
+  // but we add a shallow tiebreak: fewer graph-distance to hare.
+  let best = null, bestVal = -2, bestDist = 99;
+  for (const nf of MM.shuffle(NBR[fox].slice())) {
+    const v = solve(nf, hare, 1, hareLeft);
+    const d = dist(nf, hare);
+    if (v > bestVal || (v === bestVal && d < bestDist)) { bestVal = v; best = nf; bestDist = d; }
+  }
+  return best;
+}
+function bestHareMove(fox, hare, hareLeft) {
+  // hare minimises; tiebreak: maximise distance from fox, then prefer more escape routes.
+  let best = null, bestVal = 2, bestDist = -1, bestDeg = -1;
+  for (const nh of MM.shuffle(NBR[hare].slice())) {
+    const v = (nh === fox) ? 1 : solve(fox, nh, 0, hareLeft - 1);
+    const d = dist(nh, fox);
+    const deg = NBR[nh].length;
+    if (v < bestVal || (v === bestVal && (d > bestDist || (d === bestDist && deg > bestDeg)))) {
+      bestVal = v; best = nh; bestDist = d; bestDeg = deg;
+    }
+  }
+  return best;
+}
+// BFS graph distance between two dots (for tiebreak heuristics).
+const _dist = {};
+function dist(a, b) {
+  const k = a * 9 + b;
+  if (_dist[k] !== undefined) return _dist[k];
+  const seen = new Array(9).fill(-1); seen[a] = 0; const q = [a];
+  while (q.length) { const x = q.shift(); for (const n of NBR[x]) if (seen[n] < 0) { seen[n] = seen[x] + 1; q.push(n); } }
+  return (_dist[k] = seen[b]);
+}
+/* =================================================================================== */
+
+function onStart(mode, mount, ctx) {
+  const vsAI = mode === 'ai';
+  let humanRole = MM.load('fh-role', 'hare');   // in AI mode, which animal the human plays
+  // Game state
+  let fox, hare, turn, hareLeft, over, busy;
+
+  const panel = MM.el('div', { class: 'mm-panel mm-center mm-bounce-in' });
+
+  const pillRow = MM.el('div', { class: 'mm-pills', style: { marginBottom: '10px' } });
+  const scorebar = MM.el('div', { class: 'mm-scorebar' });
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.style.maxWidth = '100%'; svg.style.height = 'auto'; svg.style.touchAction = 'manipulation';
+  const hint = MM.el('div', { class: 'mm-hint' });
+
+  panel.append(pillRow, scorebar, svg, hint);
+  mount.appendChild(panel);
+
+  function buildPills() {
+    pillRow.innerHTML = '';
+    if (!vsAI) return;
+    pillRow.appendChild(MM.el('span', { class: 'fh-pill-label' }, 'You are:'));
+    [['Fox', 'fox', '🦊'], ['Hare', 'hare', '🐰']].forEach(([name, val, em]) => {
+      pillRow.appendChild(MM.el('button', {
+        class: 'mm-pill', 'aria-pressed': String(val === humanRole),
+        onClick: () => { if (busy) return; MM.sound.play('click'); humanRole = val; MM.store('fh-role', val); buildPills(); reset(); },
+      }, em + ' ' + name));
+    });
+  }
+
+  // 3x3 dot positions
+  let P, size, dotR;
+  function layout() {
+    size = Math.min(360, window.innerWidth - 40);
+    const pad = 46;
+    const step = (size - pad * 2) / 2;
+    dotR = Math.max(16, step * 0.14);
+    P = [];
+    for (let i = 0; i < 9; i++) { const r = Math.floor(i / 3), c = i % 3; P.push([pad + c * step, pad + r * step]); }
+    svg.setAttribute('viewBox', `0 0 ${size} ${size}`);
+    svg.style.width = size + 'px';
+  }
+
+  function svgLine(x1, y1, x2, y2, stroke, w, extra) {
+    const l = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+    l.setAttribute('x1', x1); l.setAttribute('y1', y1); l.setAttribute('x2', x2); l.setAttribute('y2', y2);
+    l.setAttribute('stroke', stroke); l.setAttribute('stroke-width', w); l.setAttribute('stroke-linecap', 'round');
+    if (extra) for (const k in extra) l.setAttribute(k, extra[k]);
+    return l;
+  }
+
+  // whose piece is the human allowed to move right now?
+  function humanTurn() {
+    if (over) return false;
+    if (!vsAI) return true;
+    const moverRole = turn === 0 ? 'fox' : 'hare';
+    return moverRole === humanRole;
+  }
+  // which dots can the mover legally move to
+  function moverPos() { return turn === 0 ? fox : hare; }
+  function legalTargets() { return NBR[moverPos()]; }
+
+  function render() {
+    layout();
+    svg.innerHTML = '';
+    // draw the grid lines (each undirected edge once)
+    for (let a = 0; a < 9; a++) for (const b of NBR[a]) if (a < b) {
+      svg.appendChild(svgLine(P[a][0], P[a][1], P[b][0], P[b][1], '#d8d2e6', dotR * 0.5));
+    }
+    const canMove = humanTurn();
+    const targets = canMove ? new Set(legalTargets()) : new Set();
+    // dots
+    for (let i = 0; i < 9; i++) {
+      const [x, y] = P[i];
+      const isTarget = targets.has(i);
+      const c = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+      c.setAttribute('cx', x); c.setAttribute('cy', y); c.setAttribute('r', dotR);
+      c.setAttribute('fill', isTarget ? '#eaffe9' : '#ffffff');
+      c.setAttribute('stroke', isTarget ? '#2ec4b6' : '#22223b');
+      c.setAttribute('stroke-width', isTarget ? 4 : 3);
+      if (isTarget) { c.style.cursor = 'pointer'; c.classList.add('fh-target'); c.addEventListener('click', () => tryMove(i)); }
+      svg.appendChild(c);
+      // occupancy emoji
+      let emoji = '';
+      if (i === fox) emoji = '🦊';
+      else if (i === hare) emoji = '🐰';
+      if (emoji) {
+        const t = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+        t.setAttribute('x', x); t.setAttribute('y', y); t.setAttribute('text-anchor', 'middle');
+        t.setAttribute('dominant-baseline', 'central'); t.setAttribute('font-size', dotR * 1.5);
+        t.style.pointerEvents = 'none'; t.textContent = emoji;
+        svg.appendChild(t);
+      } else if (isTarget) {
+        // little tap dot inside a legal empty target
+        const g = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+        g.setAttribute('cx', x); g.setAttribute('cy', y); g.setAttribute('r', dotR * 0.32);
+        g.setAttribute('fill', '#2ec4b6'); g.style.pointerEvents = 'none';
+        svg.appendChild(g);
+      }
+    }
+    renderScore();
+    statusUpdate();
+  }
+
+  function renderScore() {
+    scorebar.innerHTML = '';
+    // Fox card
+    const foxName = vsAI ? (humanRole === 'fox' ? '🦊 You' : '🦊 Computer') : '🦊 Fox';
+    scorebar.appendChild(MM.el('div', { class: 'mm-score' + (turn === 0 && !over ? ' active' : '') },
+      MM.el('span', { class: 'dot', style: { background: HEX.fox } }), foxName));
+    // Hare card with countdown
+    const hareName = vsAI ? (humanRole === 'hare' ? '🐰 You' : '🐰 Computer') : '🐰 Hare';
+    scorebar.appendChild(MM.el('div', { class: 'mm-score' + (turn === 1 && !over ? ' active' : '') },
+      MM.el('span', { class: 'dot', style: { background: HEX.hare } }), hareName,
+      MM.el('span', { class: 'fh-count', style: { color: HEX.hare } }, '🏁 ' + hareLeft + ' left')));
+  }
+
+  function statusUpdate() {
+    if (over) { hint.textContent = ''; return; }
+    const moverRole = turn === 0 ? 'fox' : 'hare';
+    const col = HEX[moverRole];
+    let who;
+    if (vsAI) who = (moverRole === humanRole) ? ('Your turn ' + (moverRole === 'fox' ? '🦊' : '🐰')) : ('Computer… ' + (moverRole === 'fox' ? '🦊' : '🐰'));
+    else who = moverRole === 'fox' ? '🦊 Fox moves' : '🐰 Hare moves';
+    MM.status(`<span class="chip" style="background:${col}">${who}</span>`);
+    if (vsAI && moverRole !== humanRole) hint.textContent = 'The computer is thinking…';
+    else hint.textContent = 'Tap a glowing dot to slide your ' + (moverRole === 'fox' ? 'fox' : 'hare') + '.';
+  }
+
+  /* ---------- moves ---------- */
+  function tryMove(to) {
+    if (over || busy || !humanTurn()) return;
+    if (!NBR[moverPos()].includes(to)) { MM.sound.play('wrong'); return; }
+    doMove(to);
+  }
+  function doMove(to) {
+    const wasFox = turn === 0;
+    if (wasFox) { fox = to; } else { hare = to; hareLeft -= 1; }
+    MM.sound.play('swoosh');
+    // check catch
+    if (fox === hare) { render(); finish('fox'); return; }
+    // hare survived all moves?
+    if (hareLeft === 0) { render(); finish('hare'); return; }
+    turn = wasFox ? 1 : 0;
+    render();
+    maybeAI();
+  }
+
+  function maybeAI() {
+    if (over) return;
+    if (!vsAI) return;
+    const moverRole = turn === 0 ? 'fox' : 'hare';
+    if (moverRole !== humanRole) { busy = true; statusUpdate(); setTimeout(aiTurn, 520); }
+  }
+
+  function aiTurn() {
+    if (over) return;
+    busy = false;
+    const to = (turn === 0) ? bestFoxMove(fox, hare, hareLeft) : bestHareMove(fox, hare, hareLeft);
+    doMove(to);
+  }
+
+  /* ---------- end ---------- */
+  function finish(winnerRole) {
+    over = true; busy = false;
+    render();
+    // glow the winning piece
+    if (vsAI) {
+      const youWin = winnerRole === humanRole;
+      MM.win({ lose: !youWin,
+        title: youWin ? 'You win! 🎉' : 'Computer wins!',
+        emoji: youWin ? (winnerRole === 'fox' ? '🦊' : '🐰') : '🤖',
+        sub: winnerRole === 'fox' ? 'The fox caught the hare!' : 'The hare got away!',
+        onAgain: () => MM.toMenu() });
+    } else {
+      MM.win({
+        title: (winnerRole === 'fox' ? 'Fox' : 'Hare') + ' wins! 🎉',
+        emoji: winnerRole === 'fox' ? '🦊' : '🐰',
+        sub: winnerRole === 'fox' ? 'Caught the hare!' : 'Escaped all 10 moves!',
+        onAgain: () => MM.toMenu() });
+    }
+  }
+
+  /* ---------- reset ---------- */
+  function reset() {
+    fox = 0; hare = 8; turn = 0; hareLeft = HARE_LIMIT; over = false; busy = false;
+    render();
+    maybeAI();     // if human is the hare, the AI fox moves first
+  }
+
+  buildPills();
+  reset();
+}
+</script>
+<style>
+  .fh-pill-label { font-weight: 800; align-self: center; }
+  .fh-count { margin-left: 4px; font-size: 15px; }
+  .fh-target { animation: fhpulse 1.3s ease infinite; }
+  @keyframes fhpulse { 0%,100% { r: attr(r); } }
+  svg .fh-target { filter: drop-shadow(0 0 3px rgba(46,196,182,.7)); }
+</style>
+</body>
+</html>

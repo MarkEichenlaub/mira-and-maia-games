@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>X-Ray Dice</title>
+<link rel="stylesheet" href="../../assets/common.css">
+</head>
+<body>
+<script src="../../assets/common.js"></script>
+<script>
+/* X-RAY DICE — a magic math trick.
+   Opposite faces of a die always add to 7. See the TOP, "x-ray" the hidden BOTTOM.
+   One die: bottom = 7 − top.  Two dice: sum of bottoms = 14 − (sum of tops).
+   Solo drill: predict, reveal, build a streak. Best streak stored via MM.store. */
+
+const BLUE = '#3a86ff', GREEN = '#2ec4b6', YELLOW = '#ffd23f', PURPLE = '#8338ec', RED = '#ff5a5f', PINK = '#ff70a6';
+
+MM.game({
+  title: 'X-Ray Dice', emoji: '🔮',
+  ba: 'https://beastacademy.com/playground/xray-dice',
+  rules: `
+    <p><b>Magic X-ray vision!</b> On every die, the numbers on <b>opposite sides always add up to 7</b>.</p>
+    <ul>
+      <li>1 is opposite 6  (1 + 6 = 7)</li>
+      <li>2 is opposite 5  (2 + 5 = 7)</li>
+      <li>3 is opposite 4  (3 + 4 = 7)</li>
+    </ul>
+    <p>So if you can see the <b>top</b>, you can "x-ray" straight through and know the <b>bottom</b>:</p>
+    <p style="font-size:20px;text-align:center"><b>bottom = 7 − top</b> 🔮</p>
+    <p><b>Two Dice</b> version: the two hidden bottoms add up to <b>14 − (top + top)</b>. Sneaky!</p>
+    <p>Predict the bottom, then reveal to flip the die over. How long can your streak get? ⭐</p>`,
+  onStart,
+});
+
+function onStart(mode, mount) {
+  let twoDice = MM.load('xray-twodice', false);
+  let streak = 0;
+  let best = MM.load('xray-best', 0);
+  let top1 = 1, top2 = 1;     // showing tops
+  let revealed = false;
+  let busy = false;
+  let answered = false;       // locked after a guess until reveal + next
+
+  const panel = MM.el('div', { class: 'mm-panel mm-center mm-bounce-in' });
+  mount.appendChild(panel);
+
+  // difficulty pills
+  const pillRow = MM.el('div', { class: 'mm-pills', style: { marginBottom: '10px' } });
+  function buildPills() {
+    pillRow.innerHTML = '';
+    [['One Die', false], ['Two Dice', true]].forEach(([label, val]) => {
+      pillRow.appendChild(MM.el('button', {
+        class: 'mm-pill', 'aria-pressed': String(val === twoDice),
+        onClick: () => {
+          if (busy) return;
+          MM.sound.play('click'); twoDice = val; MM.store('xray-twodice', val);
+          streak = 0; buildPills(); newRound(true);
+        },
+      }, (val ? '🎲🎲 ' : '🎲 ') + label));
+    });
+  }
+
+  // score row: streak + best
+  const scorebar = MM.el('div', { class: 'mm-scorebar' });
+  function buildScore() {
+    scorebar.innerHTML = '';
+    scorebar.appendChild(MM.el('div', { class: 'mm-score' },
+      MM.el('span', {}, '🔥'), MM.el('span', {}, 'Streak:'),
+      MM.el('span', { style: { color: PINK } }, String(streak))));
+    scorebar.appendChild(MM.el('div', { class: 'mm-score' },
+      MM.el('span', {}, '🏆'), MM.el('span', {}, 'Best:'),
+      MM.el('span', { style: { color: PURPLE } }, String(best))));
+    // star strip
+    const stars = MM.el('div', { class: 'mm-score' });
+    const shown = Math.min(streak, 5);
+    stars.textContent = shown ? '⭐'.repeat(shown) + (streak > 5 ? '+' : '') : '☆☆☆☆☆';
+    scorebar.appendChild(stars);
+  }
+
+  // dice display area
+  const diceRow = MM.el('div', {
+    style: { display: 'flex', gap: '16px', justifyContent: 'center', alignItems: 'center', margin: '8px 0 4px', minHeight: '92px' },
+  });
+  const dieEl1 = MM.el('div', { class: 'mm-die', style: { transform: 'scale(1.2)' } });
+  const dieEl2 = MM.el('div', { class: 'mm-die', style: { transform: 'scale(1.2)' } });
+  const plusEl = MM.el('div', { style: { fontSize: '26px', fontWeight: '900', color: 'var(--ink-soft)' } }, '+');
+
+  const topLabel = MM.el('div', { style: { fontWeight: '800', fontSize: '18px', color: 'var(--ink-soft)', marginBottom: '2px' } }, 'TOP');
+  const prompt = MM.el('div', { style: { fontSize: 'clamp(18px,4.4vw,24px)', fontWeight: '900', margin: '8px 0 4px', color: BLUE, minHeight: '1.3em' } });
+
+  // number pad 1..6
+  const pad = MM.el('div', {
+    style: { display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '10px', maxWidth: '300px', margin: '8px auto 0' },
+  });
+  // For two dice the sum can be 2..12 -> use a scrollable-ish grid 2..12
+  const padWide = MM.el('div', {
+    style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(58px, 1fr))', gap: '8px', maxWidth: '420px', margin: '8px auto 0' },
+  });
+
+  // reveal + next buttons
+  const revealBtn = MM.el('button', {
+    class: 'mm-btn purple', style: { fontSize: '20px', padding: '14px 26px', display: 'none' },
+    onClick: doReveal,
+  }, '🔮 X-Ray reveal!');
+  const nextBtn = MM.el('button', {
+    class: 'mm-btn green', style: { fontSize: '20px', padding: '14px 26px', display: 'none' },
+    onClick: () => { MM.sound.play('click'); newRound(false); },
+  }, '🎲 Next roll');
+  const helpEl = MM.el('div', { class: 'mm-hint', style: { minHeight: '1.2em' } });
+
+  panel.append(pillRow, scorebar, topLabel, diceRow, prompt);
+  const padWrap = MM.el('div');
+  panel.append(padWrap, MM.el('div', { class: 'mm-row', style: { marginTop: '10px' } }, revealBtn, nextBtn), helpEl);
+
+  buildPills();
+  buildScore();
+  newRound(true);
+
+  // ---------- rounds ----------
+  function layoutDice() {
+    diceRow.innerHTML = '';
+    if (twoDice) diceRow.append(dieEl1, plusEl, dieEl2);
+    else diceRow.append(dieEl1);
+  }
+
+  function buildPad() {
+    padWrap.innerHTML = '';
+    if (!twoDice) {
+      pad.innerHTML = '';
+      for (let n = 1; n <= 6; n++) pad.appendChild(numBtn(n));
+      padWrap.appendChild(pad);
+    } else {
+      padWide.innerHTML = '';
+      for (let n = 2; n <= 12; n++) padWide.appendChild(numBtn(n));
+      padWrap.appendChild(padWide);
+    }
+  }
+
+  function numBtn(n) {
+    return MM.el('button', {
+      class: 'mm-btn', 'data-guess': String(n),
+      style: { fontSize: '24px', padding: '16px 0', minHeight: '58px', background: '#fff', color: 'var(--ink)', boxShadow: '0 4px 0 #e7e0d0' },
+      onClick: () => guess(n),
+    }, String(n));
+  }
+
+  async function newRound(instant) {
+    busy = true; revealed = false; answered = false;
+    revealBtn.style.display = 'none';
+    nextBtn.style.display = 'none';
+    helpEl.textContent = '';
+    topLabel.textContent = twoDice ? 'TOPS (see them!)' : 'TOP (see it!)';
+    layoutDice();
+    buildPad();
+    setPadEnabled(false);
+
+    // roll the die/dice to show the tops
+    if (instant) {
+      top1 = MM.range(1, 6); const d = MM.die(top1); dieEl1.replaceChildren(...d.childNodes);
+      if (twoDice) { top2 = MM.range(1, 6); const d2 = MM.die(top2); dieEl2.replaceChildren(...d2.childNodes); }
+    } else {
+      if (twoDice) { const [a, b] = await Promise.all([MM.rollDie(dieEl1, 6), MM.rollDie(dieEl2, 6)]); top1 = a; top2 = b; }
+      else { top1 = await MM.rollDie(dieEl1, 6); }
+    }
+
+    prompt.style.color = BLUE;
+    if (twoDice) prompt.innerHTML = 'The tops are <b>' + top1 + '</b> and <b>' + top2 + '</b>. What do the two <b>bottoms</b> add up to? 🔮';
+    else prompt.innerHTML = 'The top is <b>' + top1 + '</b>. What is on the <b>bottom</b>? 🔮';
+
+    MM.status(`<span class="chip" style="background:${BLUE}">🔮 X-ray the bottom!</span>`);
+    setPadEnabled(true);
+    busy = false;
+  }
+
+  function setPadEnabled(on) {
+    padWrap.querySelectorAll('[data-guess]').forEach(b => { b.disabled = !on; });
+  }
+
+  function correctAnswer() {
+    return twoDice ? (14 - top1 - top2) : (7 - top1);
+  }
+
+  function guess(n) {
+    if (busy || answered) return;
+    answered = true;
+    setPadEnabled(false);
+    const ans = correctAnswer();
+    const right = n === ans;
+    // highlight chosen button
+    const btn = padWrap.querySelector(`[data-guess="${n}"]`);
+    if (btn) { btn.style.background = right ? GREEN : RED; btn.style.color = '#fff'; }
+    if (right) {
+      MM.sound.play('star');
+      prompt.style.color = GREEN;
+      prompt.innerHTML = '✨ Yes! Reveal to see your x-ray magic!';
+      helpEl.textContent = twoDice ? ('14 − ' + top1 + ' − ' + top2 + ' = ' + ans) : ('7 − ' + top1 + ' = ' + ans);
+    } else {
+      MM.sound.play('wrong');
+      prompt.style.color = RED;
+      prompt.innerHTML = '🤔 Not quite! Remember the trick…';
+      // gentle help
+      const alsoBtn = padWrap.querySelector(`[data-guess="${ans}"]`);
+      if (alsoBtn) { alsoBtn.style.background = GREEN; alsoBtn.style.color = '#fff'; }
+      helpEl.innerHTML = twoDice
+        ? ('Opposite sides make 7 each, so both bottoms make <b>14 − ' + top1 + ' − ' + top2 + ' = ' + ans + '</b>.')
+        : ('Opposite sides make 7, so the bottom is <b>7 − ' + top1 + ' = ' + ans + '</b>.');
+    }
+    // store result for reveal
+    pendingRight = right;
+    revealBtn.style.display = 'inline-flex';
+  }
+
+  let pendingRight = false;
+
+  async function doReveal() {
+    if (busy) return;
+    busy = true;
+    revealBtn.style.display = 'none';
+    revealed = true;
+    MM.sound.play('swoosh');
+    // "flip" the die to show the bottom (bottom = 7 - top)
+    const b1 = 7 - top1;
+    await flipTo(dieEl1, b1);
+    if (twoDice) { const b2 = 7 - top2; await flipTo(dieEl2, b2); }
+
+    topLabel.textContent = twoDice ? 'BOTTOMS revealed!' : 'BOTTOM revealed!';
+    const ans = correctAnswer();
+    if (twoDice) prompt.innerHTML = 'Bottoms are <b>' + (7 - top1) + '</b> and <b>' + (7 - top2) + '</b> → sum <b>' + ans + '</b>!';
+    else prompt.innerHTML = 'The bottom was <b>' + ans + '</b>!';
+
+    if (pendingRight) {
+      streak++;
+      if (streak > best) { best = streak; MM.store('xray-best', best); }
+      buildScore();
+      MM.sound.play('ding');
+      if (streak > 0 && streak % 5 === 0) { MM.confetti({ count: 90 }); MM.sound.play('win'); }
+      MM.status(`<span class="chip" style="background:${GREEN}">✅ Correct! Streak ${streak}</span>`);
+    } else {
+      streak = 0;
+      buildScore();
+      MM.status(`<span class="chip" style="background:${RED}">💫 Streak reset — try again!</span>`);
+    }
+    nextBtn.style.display = 'inline-flex';
+    busy = false;
+  }
+
+  async function flipTo(el, value) {
+    el.classList.add('rolling');
+    // quick spin through a couple faces for a "flip" feel
+    for (let i = 0; i < 3; i++) { const d = MM.die(MM.range(1, 6)); el.replaceChildren(...d.childNodes); await MM.sleep(70); }
+    const d = MM.die(value); el.replaceChildren(...d.childNodes);
+    el.classList.remove('rolling');
+    // pop
+    el.style.transition = 'transform .15s ease';
+    el.style.transform = 'scale(1.45)';
+    await MM.sleep(150);
+    el.style.transform = 'scale(1.2)';
+  }
+}
+</script>
+</body>
+</html>

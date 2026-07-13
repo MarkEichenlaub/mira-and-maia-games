@@ -1,0 +1,577 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Circuit Breaker</title>
+<link rel="stylesheet" href="../../assets/common.css">
+</head>
+<body>
+<script src="../../assets/common.js"></script>
+<script>
+/* CIRCUIT BREAKER — the classic Bridg-it / Gale connection game.
+   Two interleaved lattices of dots:
+     BLUE dots: W columns x H rows                (W across, H down)
+     RED  dots: (W-1) columns x (H+1) rows        (sit in the gaps, offset)
+   On your turn you draw a short wire between two ADJACENT same-color dots
+   (horizontal or vertical neighbours). Each blue wire crosses exactly one
+   possible red wire and vice-versa; claiming a wire blocks the crossing wire.
+   BLUE wins by joining LEFT edge to RIGHT edge; RED wins by joining TOP to BOTTOM.
+   Because the two lattices are dual, exactly one player can connect — no draws.
+
+   In Vs Computer the human is BLUE and moves first.
+
+   AI: a shortest-path / "resistance" heuristic. For each player, model the board
+   as a graph where already-claimed own wires cost 0, empty wires cost 1, and wires
+   blocked by the opponent cost Infinity. The AI scores each legal empty wire by how
+   much it shortens its OWN connection distance while lengthening the human's, and
+   plays the best one. Smart also grabs an immediate winning move and blocks the
+   human's immediate winning move. Easy plays a lighter, noisier version. */
+
+const HEX = { blue: '#3a86ff', red: '#ff5a5f' };
+const SOFT = { blue: '#dbe9ff', red: '#ffe0e1' };
+
+MM.game({
+  title: 'Circuit Breaker', emoji: '⚡',
+  ba: 'https://beastacademy.com/playground/circuit-breaker',
+  rules: `
+    <p><b>Connect your wires across the board!</b> Blue dots and red dots sit in a
+    grid together. You draw little wires between two dots of <b>your</b> color.</p>
+    <ol>
+      <li>Tap the space between two of your dots (side-by-side or stacked) to snap a wire in.</li>
+      <li>Blue wires and red wires <b>cross</b> — when one player claims a spot, the
+          crossing spot is blocked for the other. ⚡</li>
+      <li><b>Blue wins</b> by joining the <b>LEFT</b> side to the <b>RIGHT</b> side.</li>
+      <li><b>Red wins</b> by joining the <b>TOP</b> to the <b>BOTTOM</b>.</li>
+      <li>Somebody always connects first — there are no ties!</li>
+    </ol>
+    <p><b>Tip:</b> build toward your own goal AND cut across the path your opponent needs!</p>`,
+  modes: [
+    { id: 'ai',  emoji: '🤖', name: 'Vs Computer', sub: 'You are blue' },
+    { id: 'two', emoji: '🧑‍🤝‍🧑', name: '2 Players', sub: 'Pass & play' },
+  ],
+  onStart,
+});
+
+function onStart(mode, mount) {
+  const vsAI = mode === 'ai';
+  const AI = 'red';                       // computer plays red (human is blue, goes first)
+  let hard = MM.load('cb-hard', true);
+  let big = MM.load('cb-big', true);      // true = standard 5x4 blue grid, false = 4x3
+
+  // Board dimensions are set in reset().
+  let W, H;                               // blue grid: W cols x H rows
+  // Edge state:
+  //   hEdges[color] : horizontal wires between (col,col+1)
+  //   vEdges[color] : vertical wires between (row,row+1)
+  // Blue horizontal: (H rows) x (W-1) gaps ; Blue vertical: (H-1 gaps) x (W cols)
+  // Red  grid is (W-1) cols x (H+1) rows.
+  let blueH, blueV, redH, redV;           // 2D arrays of 0/1 claimed
+  let turn, over, busy;
+
+  const panel = MM.el('div', { class: 'mm-panel mm-center mm-bounce-in' });
+
+  const pillRow = MM.el('div', { class: 'mm-pills', style: { marginBottom: '10px' } });
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.style.maxWidth = '100%'; svg.style.height = 'auto'; svg.style.touchAction = 'manipulation';
+  const legend = MM.el('div', { class: 'cb-legend' });
+  const hint = MM.el('div', { class: 'mm-hint' });
+
+  panel.append(pillRow, legend, svg, hint);
+  mount.appendChild(panel);
+
+  function buildPills() {
+    pillRow.innerHTML = '';
+    // board-size pill (both modes)
+    pillRow.appendChild(MM.el('span', { class: 'cb-pill-label' }, 'Board:'));
+    [['Small', false, '🔹'], ['Standard', true, '🔷']].forEach(([name, val, em]) => {
+      pillRow.appendChild(MM.el('button', {
+        class: 'mm-pill', 'aria-pressed': String(val === big),
+        onClick: () => { if (busy) return; MM.sound.play('click'); big = val; MM.store('cb-big', val); buildPills(); reset(); },
+      }, em + ' ' + name));
+    });
+    if (vsAI) {
+      pillRow.appendChild(MM.el('span', { class: 'cb-pill-label', style: { marginLeft: '6px' } }, 'Robot:'));
+      [['Easy', false, '🐣'], ['Smart', true, '🧠']].forEach(([name, val, em]) => {
+        pillRow.appendChild(MM.el('button', {
+          class: 'mm-pill', 'aria-pressed': String(val === hard),
+          onClick: () => { if (busy) return; MM.sound.play('click'); hard = val; MM.store('cb-hard', val); buildPills(); },
+        }, em + ' ' + name));
+      });
+    }
+  }
+
+  function buildLegend() {
+    legend.innerHTML = '';
+    const items = vsAI
+      ? [['🧒 You', HEX.blue, 'left ↔ right'], ['🤖 Computer', HEX.red, 'top ↕ bottom']]
+      : [['🔵 Blue', HEX.blue, 'left ↔ right'], ['🔴 Red', HEX.red, 'top ↕ bottom']];
+    items.forEach(([name, col, goal]) => {
+      legend.appendChild(MM.el('div', { class: 'cb-leg' },
+        MM.el('span', { class: 'cb-legdot', style: { background: col } }),
+        MM.el('b', {}, name),
+        MM.el('span', { class: 'cb-leggoal' }, goal)));
+    });
+  }
+
+  /* ---------- geometry ---------- */
+  let gap, pad, bx0, by0, dotR;
+  function layout() {
+    // number of columns of "cells" across = W-1 ; we want dots to fill nicely
+    const size = Math.min(460, window.innerWidth - 34);
+    // blue dots span W across and H down; add half a cell margin for red overhang
+    const cols = W;            // blue columns
+    const rows = H;            // blue rows
+    pad = 26;
+    gap = Math.floor((size - pad * 2) / (cols - 1));
+    dotR = Math.max(8, Math.min(13, Math.floor(gap * 0.16)));
+    bx0 = pad; by0 = pad;
+    const wpx = pad * 2 + gap * (cols - 1);
+    const hpx = pad * 2 + gap * (rows - 1);
+    svg.setAttribute('viewBox', `0 0 ${wpx} ${hpx}`);
+    svg.style.width = wpx + 'px';
+  }
+  // pixel position of a blue dot (col c 0..W-1, row r 0..H-1)
+  function bluePos(c, r) { return [bx0 + c * gap, by0 + r * gap]; }
+  // red dots sit in the gaps: red grid (W-1) cols x (H+1) rows.
+  // red col c 0..W-2 sits at blue x between c and c+1; red row r 0..H sits half-step vertically.
+  function redPos(c, r) { return [bx0 + (c + 0.5) * gap, by0 + (r - 0.5) * gap]; }
+
+  /* ---------- element makers ---------- */
+  function svgLine(x1, y1, x2, y2, stroke, w, extra) {
+    const l = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+    l.setAttribute('x1', x1); l.setAttribute('y1', y1); l.setAttribute('x2', x2); l.setAttribute('y2', y2);
+    l.setAttribute('stroke', stroke); l.setAttribute('stroke-width', w); l.setAttribute('stroke-linecap', 'round');
+    if (extra) for (const k in extra) l.setAttribute(k, extra[k]);
+    return l;
+  }
+  function svgDot(x, y, fill) {
+    const c = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+    c.setAttribute('cx', x); c.setAttribute('cy', y); c.setAttribute('r', dotR);
+    c.setAttribute('fill', fill); c.setAttribute('stroke', '#22223b'); c.setAttribute('stroke-width', 2.5);
+    return c;
+  }
+
+  /* ---------- wire lists ----------
+     A "wire" is { color, kind:'h'|'v', c, r } for the dot pair it connects.
+     Blue h wire (c,r) connects blue(c,r)-blue(c+1,r):  c 0..W-2, r 0..H-1
+     Blue v wire (c,r) connects blue(c,r)-blue(c,r+1):  c 0..W-1, r 0..H-2
+     Red  h wire (c,r) connects red(c,r)-red(c+1,r):    c 0..W-3, r 0..H
+     Red  v wire (c,r) connects red(c,r)-red(c,r+1):    c 0..W-2, r 0..H-1
+     Duality: a BLUE vertical wire crosses exactly one RED horizontal wire, and a
+     BLUE horizontal wire crosses exactly one RED vertical wire. */
+
+  function claimedAt(color, kind, c, r) {
+    if (color === 'blue') return kind === 'h' ? blueH[r][c] : blueV[r][c];
+    return kind === 'h' ? redH[r][c] : redV[r][c];
+  }
+  function setClaim(color, kind, c, r, v) {
+    if (color === 'blue') { if (kind === 'h') blueH[r][c] = v; else blueV[r][c] = v; }
+    else { if (kind === 'h') redH[r][c] = v; else redV[r][c] = v; }
+  }
+
+  // The crossing wire for a given wire (the one blocked when this is claimed).
+  // BLUE v(c,r) [between blue rows r,r+1 at col c] crosses RED h(c-1,r+1)
+  //   red h(cc,rr) connects red(cc,rr)-red(cc+1,rr); red row r+1 is at y=(r+1-.5); blue col c.
+  // BLUE h(c,r) crosses RED v(c,r).
+  function crossOf(color, kind, c, r) {
+    if (color === 'blue') {
+      if (kind === 'v') return { color: 'red', kind: 'h', c: c - 1, r: r + 1 };
+      return { color: 'red', kind: 'v', c: c, r: r };
+    } else {
+      if (kind === 'h') return { color: 'blue', kind: 'v', c: c + 1, r: r - 1 };
+      return { color: 'blue', kind: 'h', c: c, r: r };
+    }
+  }
+  function wireExists(color, kind, c, r) {
+    if (color === 'blue') {
+      if (kind === 'h') return c >= 0 && c < W - 1 && r >= 0 && r < H;
+      return c >= 0 && c < W && r >= 0 && r < H - 1;
+    } else {
+      if (kind === 'h') return c >= 0 && c < W - 2 && r >= 0 && r <= H;
+      return c >= 0 && c < W - 1 && r >= 0 && r < H;
+    }
+  }
+  // Is this wire blocked because its crossing wire is claimed by the opponent?
+  function isBlocked(color, kind, c, r) {
+    const x = crossOf(color, kind, c, r);
+    if (!wireExists(x.color, x.kind, x.c, x.r)) return false;
+    return claimedAt(x.color, x.kind, x.c, x.r) === 1;
+  }
+  // All wires of a color as objects.
+  function allWires(color) {
+    const out = [];
+    if (color === 'blue') {
+      for (let r = 0; r < H; r++) for (let c = 0; c < W - 1; c++) out.push({ color, kind: 'h', c, r });
+      for (let r = 0; r < H - 1; r++) for (let c = 0; c < W; c++) out.push({ color, kind: 'v', c, r });
+    } else {
+      for (let r = 0; r <= H; r++) for (let c = 0; c < W - 2; c++) out.push({ color, kind: 'h', c, r });
+      for (let r = 0; r < H; r++) for (let c = 0; c < W - 1; c++) out.push({ color, kind: 'v', c, r });
+    }
+    return out;
+  }
+  function legalWires(color) {
+    return allWires(color).filter(w => !claimedAt(color, w.kind, w.c, w.r) && !isBlocked(color, w.kind, w.c, w.r));
+  }
+
+  /* ---------- connectivity (win test) ----------
+     Build a graph of the color's dots, edges = claimed own wires. Blue connects
+     any left-edge dot (col 0) to any right-edge dot (col W-1). Red connects any
+     top-edge dot (row 0) to any bottom-edge dot (row H). */
+  function blueId(c, r) { return r * W + c; }
+  function redId(c, r) { return r * (W - 1) + c; }
+
+  function blueConnected() {
+    const seen = new Array(W * H).fill(false);
+    const stack = [];
+    for (let r = 0; r < H; r++) { const id = blueId(0, r); seen[id] = true; stack.push([0, r]); }
+    while (stack.length) {
+      const [c, r] = stack.pop();
+      if (c === W - 1) return true;
+      // neighbours via claimed wires
+      // right: h(c,r) ; left: h(c-1,r) ; down: v(c,r) ; up: v(c,r-1)
+      if (c < W - 1 && blueH[r][c] && !seen[blueId(c + 1, r)]) { seen[blueId(c + 1, r)] = true; stack.push([c + 1, r]); }
+      if (c > 0 && blueH[r][c - 1] && !seen[blueId(c - 1, r)]) { seen[blueId(c - 1, r)] = true; stack.push([c - 1, r]); }
+      if (r < H - 1 && blueV[r][c] && !seen[blueId(c, r + 1)]) { seen[blueId(c, r + 1)] = true; stack.push([c, r + 1]); }
+      if (r > 0 && blueV[r - 1][c] && !seen[blueId(c, r - 1)]) { seen[blueId(c, r - 1)] = true; stack.push([c, r - 1]); }
+    }
+    return false;
+  }
+  function redConnected() {
+    const RW = W - 1, RH = H + 1;
+    const seen = new Array(RW * RH).fill(false);
+    const stack = [];
+    for (let c = 0; c < RW; c++) { const id = redId(c, 0); seen[id] = true; stack.push([c, 0]); }
+    while (stack.length) {
+      const [c, r] = stack.pop();
+      if (r === RH - 1) return true;
+      if (c < RW - 1 && redH[r][c] && !seen[redId(c + 1, r)]) { seen[redId(c + 1, r)] = true; stack.push([c + 1, r]); }
+      if (c > 0 && redH[r][c - 1] && !seen[redId(c - 1, r)]) { seen[redId(c - 1, r)] = true; stack.push([c - 1, r]); }
+      if (r < RH - 1 && redV[r][c] && !seen[redId(c, r + 1)]) { seen[redId(c, r + 1)] = true; stack.push([c, r + 1]); }
+      if (r > 0 && redV[r - 1][c] && !seen[redId(c, r - 1)]) { seen[redId(c, r - 1)] = true; stack.push([c, r - 1]); }
+    }
+    return false;
+  }
+  function winnerNow() {
+    if (blueConnected()) return 'blue';
+    if (redConnected()) return 'red';
+    return null;
+  }
+
+  /* ---------- shortest-path distance for AI heuristic ----------
+     0-1 BFS across the color's dot graph. Edge cost 0 if that wire is already
+     claimed by the color, 1 if empty & legal, Infinity if blocked. Distance =
+     min extra wires needed to connect the two goal sides. */
+  const INF = 1e9;
+  function blueDistance() {
+    // dist over blue dots; virtual source = left side, target = right side.
+    const dist = new Array(W * H).fill(INF);
+    const deque = [];
+    for (let r = 0; r < H; r++) { const id = blueId(0, r); dist[id] = 0; deque.push(id); }
+    // simple Dijkstra-ish with a bucket deque for 0/1 weights
+    while (deque.length) {
+      deque.sort((a, b) => dist[a] - dist[b]);
+      const id = deque.shift();
+      const c = id % W, r = (id - c) / W;
+      const relax = (nc, nr, kind, ec, er) => {
+        if (nc < 0 || nc >= W || nr < 0 || nr >= H) return;
+        // wire between (c,r) and (nc,nr): determine cost
+        let cost;
+        const claimed = kind === 'h' ? blueH[er][ec] : blueV[er][ec];
+        if (claimed) cost = 0;
+        else if (isBlocked('blue', kind, ec, er)) return;
+        else cost = 1;
+        const nid = blueId(nc, nr);
+        if (dist[id] + cost < dist[nid]) { dist[nid] = dist[id] + cost; deque.push(nid); }
+      };
+      if (c < W - 1) relax(c + 1, r, 'h', c, r);
+      if (c > 0) relax(c - 1, r, 'h', c - 1, r);
+      if (r < H - 1) relax(c, r + 1, 'v', c, r);
+      if (r > 0) relax(c, r - 1, 'v', c, r - 1);
+    }
+    let best = INF;
+    for (let r = 0; r < H; r++) best = Math.min(best, dist[blueId(W - 1, r)]);
+    return best;
+  }
+  function redDistance() {
+    const RW = W - 1, RH = H + 1;
+    const dist = new Array(RW * RH).fill(INF);
+    const deque = [];
+    for (let c = 0; c < RW; c++) { const id = redId(c, 0); dist[id] = 0; deque.push(id); }
+    while (deque.length) {
+      deque.sort((a, b) => dist[a] - dist[b]);
+      const id = deque.shift();
+      const c = id % RW, r = (id - c) / RW;
+      const relax = (nc, nr, kind, ec, er) => {
+        if (nc < 0 || nc >= RW || nr < 0 || nr >= RH) return;
+        let cost;
+        const claimed = kind === 'h' ? redH[er][ec] : redV[er][ec];
+        if (claimed) cost = 0;
+        else if (isBlocked('red', kind, ec, er)) return;
+        else cost = 1;
+        const nid = redId(nc, nr);
+        if (dist[id] + cost < dist[nid]) { dist[nid] = dist[id] + cost; deque.push(nid); }
+      };
+      if (c < RW - 1) relax(c + 1, r, 'h', c, r);
+      if (c > 0) relax(c - 1, r, 'h', c - 1, r);
+      if (r < RH - 1) relax(c, r + 1, 'v', c, r);
+      if (r > 0) relax(c, r - 1, 'v', c, r - 1);
+    }
+    let best = INF;
+    for (let c = 0; c < RW; c++) best = Math.min(best, dist[redId(c, RH - 1)]);
+    return best;
+  }
+  function myDist(color) { return color === 'blue' ? blueDistance() : redDistance(); }
+  function oppDist(color) { return color === 'blue' ? redDistance() : blueDistance(); }
+
+  /* ---------- render ---------- */
+  function render() {
+    layout();
+    svg.innerHTML = '';
+    const humanControls = !over && (!vsAI || turn !== AI);
+
+    // faint guide rails for legal empty wires of the CURRENT player (clickable)
+    const clickTargets = humanControls ? legalWires(turn) : [];
+    const clickSet = new Set(clickTargets.map(w => w.color + w.kind + w.c + '_' + w.r));
+
+    // Draw all empty legal wire guides (both colors, subtle) so kids see the lattice.
+    function drawGuide(color, kind, c, r) {
+      let x1, y1, x2, y2;
+      if (color === 'blue') {
+        if (kind === 'h') { [x1, y1] = bluePos(c, r); [x2, y2] = bluePos(c + 1, r); }
+        else { [x1, y1] = bluePos(c, r); [x2, y2] = bluePos(c, r + 1); }
+      } else {
+        if (kind === 'h') { [x1, y1] = redPos(c, r); [x2, y2] = redPos(c + 1, r); }
+        else { [x1, y1] = redPos(c, r); [x2, y2] = redPos(c, r + 1); }
+      }
+      const claimed = claimedAt(color, kind, c, r);
+      const blocked = isBlocked(color, kind, c, r);
+      if (claimed) {
+        svg.appendChild(svgLine(x1, y1, x2, y2, HEX[color], dotR * 1.5));
+        return;
+      }
+      if (blocked) return;                 // don't draw guides for blocked wires
+      const key = color + kind + c + '_' + r;
+      const isMine = color === turn;
+      const g = svgLine(x1, y1, x2, y2, SOFT[color], dotR * 1.15,
+        { 'stroke-dasharray': '2 7', 'stroke-opacity': isMine && humanControls ? 0.9 : 0.4 });
+      if (humanControls && clickSet.has(key)) {
+        // wide invisible hit area for easy tapping
+        const hit = svgLine(x1, y1, x2, y2, 'transparent', Math.max(22, gap * 0.5));
+        hit.style.cursor = 'pointer';
+        hit.classList.add('cb-hit');
+        hit.addEventListener('click', () => tryClaim(color, kind, c, r));
+        svg.appendChild(g);
+        svg.appendChild(hit);
+      } else {
+        svg.appendChild(g);
+      }
+    }
+
+    // draw guides & wires
+    for (const w of allWires('blue')) drawGuide('blue', w.kind, w.c, w.r);
+    for (const w of allWires('red')) drawGuide('red', w.kind, w.c, w.r);
+
+    // dots on top
+    for (let r = 0; r < H; r++) for (let c = 0; c < W; c++) { const [x, y] = bluePos(c, r); svg.appendChild(svgDot(x, y, HEX.blue)); }
+    for (let r = 0; r <= H; r++) for (let c = 0; c < W - 1; c++) { const [x, y] = redPos(c, r); svg.appendChild(svgDot(x, y, HEX.red)); }
+
+    statusUpdate();
+  }
+
+  function statusUpdate() {
+    if (over) { hint.textContent = ''; return; }
+    let who;
+    if (vsAI) who = turn === AI ? '🤖 Computer…' : '🧒 Your turn (Blue)';
+    else who = turn === 'blue' ? '🔵 Blue' : '🔴 Red';
+    MM.status(`<span class="chip" style="background:${HEX[turn]}">${who}</span>`);
+    if (vsAI && turn === AI) hint.textContent = 'The computer is wiring…';
+    else hint.textContent = turn === 'blue'
+      ? 'Tap a dotted gap between two blue dots to connect LEFT ↔ RIGHT.'
+      : 'Tap a dotted gap between two red dots to connect TOP ↕ BOTTOM.';
+  }
+
+  /* ---------- moves ---------- */
+  function tryClaim(color, kind, c, r) {
+    if (over || busy) return;
+    if (color !== turn) { MM.sound.play('wrong'); return; }
+    if (vsAI && turn === AI) return;
+    if (claimedAt(color, kind, c, r) || isBlocked(color, kind, c, r)) { MM.sound.play('wrong'); return; }
+    commit(color, kind, c, r);
+  }
+  function commit(color, kind, c, r) {
+    setClaim(color, kind, c, r, 1);
+    MM.sound.play('place');
+    render();
+    const w = winnerNow();
+    if (w) { finish(w); return; }
+    turn = turn === 'blue' ? 'red' : 'blue';
+    render();
+    maybeAI();
+  }
+
+  function maybeAI() {
+    if (over) return;
+    if (vsAI && turn === AI) { busy = true; statusUpdate(); setTimeout(aiTurn, 480); }
+  }
+
+  /* ---------- AI ---------- */
+  function scoreMove(color, w) {
+    // apply, measure, undo
+    setClaim(color, w.kind, w.c, w.r, 1);
+    const md = myDist(color);
+    const od = oppDist(color);
+    setClaim(color, w.kind, w.c, w.r, 0);
+    // We want SMALL own distance and LARGE opponent distance.
+    // Weight own progress a bit higher than blocking.
+    return { md, od, score: -md * 1.15 + od * 0.85 };
+  }
+  function aiTurn() {
+    if (over) return;
+    const me = AI, opp = me === 'blue' ? 'red' : 'blue';
+    const moves = legalWires(me);
+    if (moves.length === 0) { busy = false; return; }   // shouldn't happen (dual → someone connects)
+
+    // 1) immediate winning move?
+    for (const w of MM.shuffle(moves.slice())) {
+      setClaim(me, w.kind, w.c, w.r, 1);
+      const won = (me === 'blue' ? blueConnected() : redConnected());
+      setClaim(me, w.kind, w.c, w.r, 0);
+      if (won) { busy = false; commit(me, w.kind, w.c, w.r); return; }
+    }
+
+    if (hard) {
+      // 2) block the human's immediate win (any single empty wire that lets them connect).
+      const oppMoves = legalWires(opp);
+      const threats = [];
+      for (const ow of oppMoves) {
+        setClaim(opp, ow.kind, ow.c, ow.r, 1);
+        const won = (opp === 'blue' ? blueConnected() : redConnected());
+        setClaim(opp, ow.kind, ow.c, ow.r, 0);
+        if (won) threats.push(ow);
+      }
+      if (threats.length === 1) {
+        // claim the wire that CROSSES their winning wire, if it's a legal move for us.
+        const t = threats[0];
+        const x = crossOf(opp, t.kind, t.c, t.r);
+        if (x.color === me && wireExists(x.color, x.kind, x.c, x.r) &&
+            !claimedAt(x.color, x.kind, x.c, x.r) && !isBlocked(x.color, x.kind, x.c, x.r)) {
+          busy = false; commit(me, x.kind, x.c, x.r); return;
+        }
+      }
+    }
+
+    // 3) resistance heuristic: pick the empty wire with the best score.
+    let best = null, bestScore = -Infinity;
+    const scored = moves.map(w => ({ w, ...scoreMove(me, w) }));
+    for (const s of MM.shuffle(scored)) {
+      let val = s.score;
+      if (!hard) val += (Math.random() - 0.5) * 3;      // Easy: noisier, less focused
+      if (val > bestScore) { bestScore = val; best = s.w; }
+    }
+    if (!hard && Math.random() < 0.22) best = MM.choice(moves);  // Easy blunders sometimes
+    busy = false;
+    commit(me, best.kind, best.c, best.r);
+  }
+
+  /* ---------- end ---------- */
+  function finish(winColor) {
+    over = true; busy = false;
+    render();
+    highlightPath(winColor);
+    if (vsAI) {
+      const youWin = winColor === 'blue';
+      MM.win({ lose: !youWin, title: youWin ? 'You win! ⚡' : 'Computer wins!',
+        emoji: youWin ? '🏆' : '🤖',
+        sub: youWin ? 'Your blue wire crossed the board!' : 'The red wire got through.',
+        onAgain: () => MM.toMenu() });
+    } else {
+      MM.win({ title: (winColor === 'blue' ? 'Blue' : 'Red') + ' wins! 🎉',
+        emoji: winColor === 'blue' ? '🔵' : '🔴',
+        sub: winColor === 'blue' ? 'Connected left to right!' : 'Connected top to bottom!',
+        onAgain: () => MM.toMenu() });
+    }
+  }
+
+  // Draw a golden glow over the winning wires (recompute one connecting path).
+  function highlightPath(color) {
+    // BFS from goal side recording parents, then trace from the reached opposite side.
+    if (color === 'blue') {
+      const par = new Array(W * H).fill(-1);
+      const seen = new Array(W * H).fill(false);
+      const q = [];
+      for (let r = 0; r < H; r++) { seen[blueId(0, r)] = true; q.push([0, r]); }
+      let end = -1;
+      while (q.length) {
+        const [c, r] = q.shift(); const id = blueId(c, r);
+        if (c === W - 1) { end = id; break; }
+        const nb = [];
+        if (c < W - 1 && blueH[r][c]) nb.push([c + 1, r]);
+        if (c > 0 && blueH[r][c - 1]) nb.push([c - 1, r]);
+        if (r < H - 1 && blueV[r][c]) nb.push([c, r + 1]);
+        if (r > 0 && blueV[r - 1][c]) nb.push([c, r - 1]);
+        for (const [nc, nr] of nb) { const nid = blueId(nc, nr); if (!seen[nid]) { seen[nid] = true; par[nid] = id; q.push([nc, nr]); } }
+      }
+      traceGlow(par, end, W, bluePos);
+    } else {
+      const RW = W - 1, RH = H + 1;
+      const par = new Array(RW * RH).fill(-1);
+      const seen = new Array(RW * RH).fill(false);
+      const q = [];
+      for (let c = 0; c < RW; c++) { seen[redId(c, 0)] = true; q.push([c, 0]); }
+      let end = -1;
+      while (q.length) {
+        const [c, r] = q.shift(); const id = redId(c, r);
+        if (r === RH - 1) { end = id; break; }
+        const nb = [];
+        if (c < RW - 1 && redH[r][c]) nb.push([c + 1, r]);
+        if (c > 0 && redH[r][c - 1]) nb.push([c - 1, r]);
+        if (r < RH - 1 && redV[r][c]) nb.push([c, r + 1]);
+        if (r > 0 && redV[r - 1][c]) nb.push([c, r - 1]);
+        for (const [nc, nr] of nb) { const nid = redId(nc, nr); if (!seen[nid]) { seen[nid] = true; par[nid] = id; q.push([nc, nr]); } }
+      }
+      traceGlow(par, end, RW, redPos);
+    }
+  }
+  function traceGlow(par, end, cols, posFn) {
+    if (end < 0) return;
+    let id = end;
+    const pts = [];
+    while (id !== -1) { const c = id % cols, r = (id - c) / cols; pts.push(posFn(c, r)); id = par[id]; }
+    for (let i = 0; i + 1 < pts.length; i++) {
+      const g = svgLine(pts[i][0], pts[i][1], pts[i + 1][0], pts[i + 1][1], '#ffd23f', dotR * 2.1, { 'stroke-opacity': 0.85 });
+      g.classList.add('cb-glow');
+      svg.appendChild(g);
+    }
+    MM.confetti();
+  }
+
+  /* ---------- reset ---------- */
+  function reset() {
+    if (big) { W = 5; H = 4; } else { W = 4; H = 3; }
+    blueH = Array.from({ length: H }, () => Array(W - 1).fill(0));
+    blueV = Array.from({ length: H - 1 }, () => Array(W).fill(0));
+    redH = Array.from({ length: H + 1 }, () => Array(Math.max(0, W - 2)).fill(0));
+    redV = Array.from({ length: H }, () => Array(W - 1).fill(0));
+    turn = 'blue'; over = false; busy = false;
+    buildLegend();
+    render();
+    maybeAI();          // (human is blue & first, so this never fires here, but safe)
+  }
+
+  buildPills();
+  reset();
+}
+</script>
+<style>
+  .cb-legend { display: flex; gap: 14px; justify-content: center; flex-wrap: wrap; margin: 4px 0 10px; }
+  .cb-leg { display: flex; align-items: center; gap: 6px; font-size: 15px; background: #fff; padding: 6px 12px; border-radius: 999px; box-shadow: 0 3px 0 #e7e0d0; }
+  .cb-legdot { width: 14px; height: 14px; border-radius: 50%; border: 2px solid #22223b; }
+  .cb-leggoal { color: var(--ink-soft); font-size: 13px; }
+  .cb-pill-label { font-weight: 800; align-self: center; }
+  svg .cb-hit:active { }
+  .cb-glow { animation: cbglow 1s ease-in-out infinite; }
+  @keyframes cbglow { 0%,100% { stroke-opacity: .55; } 50% { stroke-opacity: 1; } }
+</style>
+</body>
+</html>

@@ -1,0 +1,365 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Spin-a-Dodecahedron</title>
+<link rel="stylesheet" href="../../assets/common.css">
+</head>
+<body>
+<script src="../../assets/common.js"></script>
+<script>
+/* SPIN-A-DODECAHEDRON — a real regular dodecahedron you can drag to spin.
+   20 vertices, 12 pentagon faces, 30 edges. Vertices come from the classic
+   coordinates using the golden ratio phi. We rotate the points in 3D,
+   project with simple perspective, painter's-sort the faces, and draw. */
+
+const PHI = (1 + Math.sqrt(5)) / 2;
+const INV = 1 / PHI;
+
+// 20 vertices of a regular dodecahedron (golden-ratio construction).
+const V = [];
+// (±1, ±1, ±1)
+for (const x of [-1, 1]) for (const y of [-1, 1]) for (const z of [-1, 1]) V.push([x, y, z]);
+// (0, ±1/phi, ±phi)
+for (const y of [-INV, INV]) for (const z of [-PHI, PHI]) V.push([0, y, z]);
+// (±1/phi, ±phi, 0)
+for (const x of [-INV, INV]) for (const y of [-PHI, PHI]) V.push([x, y, 0]);
+// (±phi, 0, ±1/phi)
+for (const x of [-PHI, PHI]) for (const z of [-INV, INV]) V.push([x, 0, z]);
+
+// helper: index of the vertex nearest a coordinate (build faces robustly)
+function vi(x, y, z) {
+  let best = 0, bd = Infinity;
+  for (let i = 0; i < V.length; i++) {
+    const d = (V[i][0]-x)**2 + (V[i][1]-y)**2 + (V[i][2]-z)**2;
+    if (d < bd) { bd = d; best = i; }
+  }
+  return best;
+}
+
+// The 12 pentagon faces, listed as vertex indices in order around each face.
+// Built by grouping vertices that share a face. We derive them from the known
+// edge length: two vertices are connected iff their distance == 2/phi.
+const EDGE_LEN = 2 * INV; // shortest vertex-vertex distance in this construction
+const adj = V.map(() => []);
+const EDGES = [];
+for (let i = 0; i < V.length; i++) {
+  for (let j = i + 1; j < V.length; j++) {
+    const d = Math.sqrt((V[i][0]-V[j][0])**2 + (V[i][1]-V[j][1])**2 + (V[i][2]-V[j][2])**2);
+    if (Math.abs(d - EDGE_LEN) < 1e-6) { adj[i].push(j); adj[j].push(i); EDGES.push([i, j]); }
+  }
+}
+
+// Recover the 12 pentagon faces by walking rings of length 5.
+// From each directed edge, always turn "most consistently" to trace a pentagon.
+function faceNormal(idx) {
+  // centroid-based normal for a face (list of vertex indices)
+  const c = [0, 0, 0];
+  for (const k of idx) { c[0] += V[k][0]; c[1] += V[k][1]; c[2] += V[k][2]; }
+  c[0] /= idx.length; c[1] /= idx.length; c[2] /= idx.length;
+  return c; // for a solid centered at origin, centroid direction == outward normal
+}
+function cross(a, b) { return [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]]; }
+function sub(a, b) { return [a[0]-b[0], a[1]-b[1], a[2]-b[2]]; }
+function dot(a, b) { return a[0]*b[0]+a[1]*b[1]+a[2]*b[2]; }
+
+const FACES = [];
+const seen = new Set();
+for (let s = 0; s < V.length; s++) {
+  for (const t of adj[s]) {
+    // trace a pentagon starting s->t, turning to keep the face planar
+    const ring = [s, t];
+    let prev = s, curV = t;
+    let ok = true;
+    for (let step = 0; step < 4; step++) {
+      // candidate next = neighbor of cur (not prev) that forms the tightest
+      // consistent turn (smallest angle keeps us on one pentagon)
+      const cands = adj[curV].filter(n => n !== prev);
+      // pick the neighbor whose turn direction is consistent (cross products align)
+      let pick = -1, bestScore = -Infinity;
+      const inDir = sub(V[curV], V[prev]);
+      const nrm = faceNormal([prev, curV, cands[0]]); // approximate face plane
+      for (const n of cands) {
+        const outDir = sub(V[n], V[curV]);
+        const turn = cross(inDir, outDir);
+        // prefer turns whose axis points the same way as the outward centroid,
+        // giving a consistently-wound convex pentagon
+        const score = dot(turn, faceNormal([prev, curV, n]));
+        if (score > bestScore) { bestScore = score; pick = n; }
+      }
+      if (pick < 0) { ok = false; break; }
+      ring.push(pick);
+      prev = curV; curV = pick;
+    }
+    if (!ok) continue;
+    if (ring.length === 6 && ring[5] === s) ring.pop(); // closed back to start
+    if (ring.length !== 5) continue;
+    const key = ring.slice().sort((a, b) => a - b).join(',');
+    if (seen.has(key)) continue;
+    // sanity: all edges of the ring must be real edges
+    let good = true;
+    for (let k = 0; k < 5; k++) if (!adj[ring[k]].includes(ring[(k+1)%5])) { good = false; break; }
+    if (!good) continue;
+    seen.add(key);
+    FACES.push(ring);
+  }
+}
+
+const FACE_COLORS = ['#3a86ff','#ff5a5f','#2ec4b6','#ffd23f','#8338ec','#ff70a6',
+  '#ff9f1c','#3a86ff','#2ec4b6','#ff70a6','#8338ec','#ffd23f'];
+
+MM.game({
+  title: 'Spin-a-Dodecahedron', emoji: '⬡',
+  ba: 'https://beastacademy.com/playground/popup-dodecahedron',
+  rules: `
+    <p>A <b>dodecahedron</b> is a 3D shape built from <b>12 flat pentagons</b>
+    (five-sided shapes). Say it: <i>doe-DECK-a-HEE-drun!</i> 🗣️</p>
+    <p>Drag it with your finger to <b>spin it around</b>. It also gently spins by itself.</p>
+    <p>Tap the buttons to count its parts:</p>
+    <ul>
+      <li><b>Faces = 12</b> — the flat pentagon sides 🟦</li>
+      <li><b>Corners (vertices) = 20</b> — the pointy tips 📍</li>
+      <li><b>Edges = 30</b> — the lines where two faces meet ➖</li>
+    </ul>
+    <p>Fun fact: it's one of only <b>5 Platonic solids</b> — the perfect shapes
+    where every face is the same. The others are the cube, pyramid (tetrahedron),
+    octahedron, and icosahedron. ✨</p>`,
+  onStart,
+});
+
+function onStart(mode, mount) {
+  const size = Math.min(400, window.innerWidth - 40);
+  const canvas = MM.el('canvas', { width: size, height: size,
+    style: { width: size + 'px', height: size + 'px', touchAction: 'none', cursor: 'grab' } });
+  const g = canvas.getContext('2d');
+
+  // rotation state
+  let rotX = -0.35, rotY = 0.6;
+  let velX = 0, velY = 0.006;     // gentle auto-spin
+  let dragging = false, lastX = 0, lastY = 0, lastT = 0;
+
+  // highlight state: null | 'faces' | 'verts' | 'edges'
+  let highlight = null;
+  let hlPulse = 0;
+  let unfold = 0;          // 0 = solid, 1 = flattened toward a net
+  let unfoldTarget = 0;
+
+  const scale = size * 0.30;
+  const cx = size / 2, cy = size / 2;
+  const CAM = 5.2; // camera distance for perspective
+
+  function rotate(p) {
+    let [x, y, z] = p;
+    // rotate around Y then X
+    let cxr = Math.cos(rotY), sxr = Math.sin(rotY);
+    let x1 = x * cxr + z * sxr;
+    let z1 = -x * sxr + z * cxr;
+    let cyr = Math.cos(rotX), syr = Math.sin(rotX);
+    let y1 = y * cyr - z1 * syr;
+    let z2 = y * syr + z1 * cyr;
+    return [x1, y1, z2];
+  }
+  function project(p) {
+    const z = p[2] + CAM;
+    const f = CAM / z;                 // simple perspective
+    return [cx + p[0] * scale * f, cy - p[1] * scale * f, p[2]];
+  }
+
+  function faceCentroid3(face, pts3) {
+    const c = [0, 0, 0];
+    for (const k of face) { c[0]+=pts3[k][0]; c[1]+=pts3[k][1]; c[2]+=pts3[k][2]; }
+    return [c[0]/face.length, c[1]/face.length, c[2]/face.length];
+  }
+
+  function draw() {
+    // integrate rotation
+    if (!dragging) { rotX += velX; rotY += velY; }
+    // friction on flung velocity, but keep a gentle base auto-spin
+    velX *= 0.96; velY = velY * 0.96 + 0.006 * 0.04;
+    if (Math.abs(velY) < 0.006) velY = 0.006 * Math.sign(velY || 1);
+
+    // ease the unfold
+    unfold += (unfoldTarget - unfold) * 0.12;
+
+    g.clearRect(0, 0, size, size);
+
+    // For "unfold" we push faces outward along their normals to hint a net.
+    const rot3 = V.map(rotate);
+
+    // Build per-face rotated points, optionally exploded outward for unfold.
+    const faceData = FACES.map((face, fi) => {
+      const cRaw = faceCentroid3(face, V);         // outward direction (unrotated)
+      const cRot = rotate(cRaw);
+      const explode = unfold * 1.15;               // how far to push out
+      const pts3 = face.map(k => {
+        const base = rot3[k];
+        // move each vertex outward along the rotated face-normal direction
+        return [base[0] + cRot[0]*explode, base[1] + cRot[1]*explode, base[2] + cRot[2]*explode];
+      });
+      const cen = [cRot[0]*(1+explode), cRot[1]*(1+explode), cRot[2]*(1+explode)];
+      // outward normal (for lighting & back-face) ~ rotated centroid direction
+      const nrm = cRot;
+      return { face, fi, pts3, cen, nrm };
+    });
+
+    // painter's algorithm: far faces first
+    faceData.sort((a, b) => a.cen[2] - b.cen[2]);
+
+    const pulse = 0.5 + 0.5 * Math.sin(hlPulse);
+
+    for (const fd of faceData) {
+      const proj = fd.pts3.map(project);
+      // back-face: normal pointing away from camera (+z is toward viewer here
+      // because we subtract p[1] and camera looks down -z after +CAM shift)
+      const facing = fd.nrm[2];        // >0 means toward camera
+      const isBack = facing < 0 && unfold < 0.05;
+
+      // simple diffuse shade from a light up-and-right
+      const L = [0.4, 0.6, 0.7];
+      const nlen = Math.hypot(fd.nrm[0], fd.nrm[1], fd.nrm[2]) || 1;
+      let lit = (fd.nrm[0]*L[0] + fd.nrm[1]*L[1] + fd.nrm[2]*L[2]) / nlen;
+      lit = 0.55 + 0.45 * Math.max(0, lit);
+
+      let col = FACE_COLORS[fd.fi % FACE_COLORS.length];
+      if (isBack) col = '#d9d2e6';
+
+      // face fill
+      g.beginPath();
+      g.moveTo(proj[0][0], proj[0][1]);
+      for (let i = 1; i < proj.length; i++) g.lineTo(proj[i][0], proj[i][1]);
+      g.closePath();
+
+      if (highlight === 'faces' && !isBack) {
+        g.fillStyle = shade(col, 0.55 + 0.45 * pulse);
+        g.globalAlpha = 1;
+      } else {
+        g.fillStyle = shade(col, lit);
+        g.globalAlpha = isBack ? 0.35 : 1;
+      }
+      g.fill();
+      g.globalAlpha = 1;
+
+      // edges
+      const edgeHot = highlight === 'edges';
+      g.lineJoin = 'round';
+      g.strokeStyle = edgeHot ? shade('#22223b', 1) : 'rgba(34,34,59,.55)';
+      g.lineWidth = edgeHot ? (2.2 + 2.6 * pulse) : 2;
+      g.stroke();
+    }
+
+    // vertices on top (only front-ish ones drawn bigger)
+    if (highlight === 'verts') {
+      for (let i = 0; i < rot3.length; i++) {
+        const pr = project(rot3[i]);
+        const front = rot3[i][2] > -0.2;
+        const r = (front ? 7 : 4) + (front ? 3 * pulse : 0);
+        g.beginPath();
+        g.arc(pr[0], pr[1], r, 0, Math.PI * 2);
+        g.fillStyle = front ? '#ff5a5f' : '#ffb3b5';
+        g.fill();
+        g.lineWidth = 2; g.strokeStyle = '#fff'; g.stroke();
+      }
+    }
+
+    hlPulse += 0.14;
+    requestAnimationFrame(draw);
+  }
+
+  // lighten/darken a hex color by factor (0..~1.4)
+  function shade(hex, f) {
+    const r = parseInt(hex.slice(1, 3), 16), gg = parseInt(hex.slice(3, 5), 16), b = parseInt(hex.slice(5, 7), 16);
+    const cl = v => Math.max(0, Math.min(255, Math.round(v * f)));
+    return `rgb(${cl(r)},${cl(gg)},${cl(b)})`;
+  }
+
+  // ---- drag to spin ----
+  function down(e) {
+    dragging = true; canvas.style.cursor = 'grabbing';
+    const p = pt(e); lastX = p.x; lastY = p.y; lastT = performance.now();
+    velX = 0; velY = 0;
+    MM.sound.play('click');
+    e.preventDefault();
+  }
+  function move(e) {
+    if (!dragging) return;
+    const p = pt(e);
+    const dx = p.x - lastX, dy = p.y - lastY;
+    rotY += dx * 0.01;
+    rotX += dy * 0.01;
+    rotX = Math.max(-1.4, Math.min(1.4, rotX));
+    velY = dx * 0.0008; velX = dy * 0.0008;
+    lastX = p.x; lastY = p.y;
+    e.preventDefault();
+  }
+  function up() {
+    if (dragging) MM.sound.play('swoosh');
+    dragging = false; canvas.style.cursor = 'grab';
+  }
+  function pt(e) {
+    const r = canvas.getBoundingClientRect();
+    const t = e.touches ? e.touches[0] : e;
+    return { x: t.clientX - r.left, y: t.clientY - r.top };
+  }
+  canvas.addEventListener('pointerdown', down);
+  window.addEventListener('pointermove', move);
+  window.addEventListener('pointerup', up);
+
+  // ---- count buttons ----
+  function countBtn(label, kind, color, num, fact) {
+    return MM.el('button', { class: 'mm-btn dd-btn', style: { background: color },
+      onClick: () => {
+        MM.sound.play('pop');
+        highlight = (highlight === kind) ? null : kind;
+        hlPulse = 0;
+        setActive();
+        if (highlight) {
+          MM.status(`<b>${num}</b> ${label} — ${fact}`);
+          const rct = canvas.getBoundingClientRect();
+          MM.confetti({ count: 26, x: rct.left + rct.width / 2, y: rct.top + 30 });
+          MM.sound.play('ding');
+        } else {
+          MM.status('Drag to spin the dodecahedron! 🌀');
+        }
+      } }, `${label} (${num})`);
+  }
+  const bFaces = countBtn('Faces', 'faces', '#3a86ff', 12, '12 pentagon faces! 🟦');
+  const bVerts = countBtn('Corners', 'verts', '#ff5a5f', 20, '20 pointy corners! 📍');
+  const bEdges = countBtn('Edges', 'edges', '#2ec4b6', 30, '30 edges where faces meet! ➖');
+  const btnRow = MM.el('div', { class: 'mm-row', style: { marginTop: '16px' } }, bFaces, bVerts, bEdges);
+
+  function setActive() {
+    [[bFaces,'faces'],[bVerts,'verts'],[bEdges,'edges']].forEach(([b,k]) => {
+      b.style.outline = highlight === k ? '4px solid #ffd23f' : 'none';
+    });
+  }
+
+  // unfold toggle
+  const unfoldBtn = MM.el('button', { class: 'mm-btn ghost dd-btn', onClick: () => {
+    unfoldTarget = unfoldTarget > 0.5 ? 0 : 1;
+    MM.sound.play(unfoldTarget > 0.5 ? 'swoosh' : 'place');
+    unfoldBtn.textContent = unfoldTarget > 0.5 ? '🔷 Fold up' : '📄 Unfold';
+  } }, '📄 Unfold');
+
+  const panel = MM.el('div', { class: 'mm-panel mm-center mm-bounce-in' },
+    MM.el('div', { class: 'mm-hint', style: { marginTop: 0 } },
+      'Drag the shape to spin it! Tap a button to count its parts.'),
+    canvas,
+    btnRow,
+    MM.el('div', { class: 'mm-row', style: { marginTop: '12px' } }, unfoldBtn),
+    MM.el('div', { class: 'dd-count' },
+      `Built from ${FACES.length} faces, ${V.length} corners, ${EDGES.length} edges.`));
+  mount.appendChild(panel);
+
+  MM.status('Drag to spin the dodecahedron! 🌀');
+  requestAnimationFrame(draw);
+}
+</script>
+<style>
+  canvas { border-radius: 20px; background: radial-gradient(circle at 40% 30%, #fffdf7, #f2ecff);
+    box-shadow: 0 8px 0 #e7e0d0; touch-action: none; }
+  .dd-btn { min-height: 50px; font-size: 17px; padding: 12px 18px; }
+  .dd-count { margin-top: 14px; color: var(--ink-soft); font-weight: 800; font-size: 15px; }
+</style>
+</body>
+</html>

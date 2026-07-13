@@ -1,0 +1,423 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Cookie Cutter</title>
+<link rel="stylesheet" href="../../assets/common.css">
+</head>
+<body>
+<script src="../../assets/common.js"></script>
+<script>
+/* COOKIE CUTTER — stamp cookies onto a dough sheet. A stamp can't overlap another cookie
+   or hang off the edge. The player who stamps the LAST cookie that fits WINS.
+   (A last-move-wins combinatorial game.)
+
+   GRID VERSION: the dough is a GROWS×GCOLS grid of cells. A cookie is a fixed footprint:
+     • 1x1 round cookie (easiest — pure parity),
+     • 2x1 pill (rotatable to 1x2),
+     • 2x2 big cookie.
+   Stamping fills those cells; overlaps and off-sheet placements are illegal.
+
+   AI:
+     • 1x1: the whole game is just PARITY of empty cells — solved instantly.
+     • 2x1 / 2x2: minimax over grid occupancy with memoization (bitmask key) and a NODE
+       BUDGET; if the position is too big, fall back to a heuristic (mobility parity).
+   Easy/Smart pill. */
+
+const HEX = { 1: '#3a86ff', 2: '#ff5a5f' };
+const COOKIE_EMOJI = ['🍪','🥮','🧁','🍩'];   // just for cute variety per stamp
+
+MM.game({
+  title: 'Cookie Cutter', emoji: '🍪',
+  ba: 'https://beastacademy.com/playground/cookie-cutter',
+  rules: `
+    <p><b>Stamp the last cookie to win!</b> Take turns pressing cookie stamps into the dough 🍪.</p>
+    <ol>
+      <li>Tap the dough to stamp your cookie. It can't <b>overlap</b> another cookie or hang <b>off the edge</b>.</li>
+      <li>Pick your cookie size below. Big cookies (2×1 or 2×2) can be <b>turned</b> with the 🔄 button.</li>
+      <li>When the dough is too full for anyone to stamp, whoever stamped <b>last WINS</b>! 🏆</li>
+    </ol>
+    <p><b>Tiny-baker tip:</b> start with the 1×1 round cookie — then it's all about counting
+    empty spaces. Try to leave an <b>odd</b> number of spaces for your friend to face!</p>`,
+  modes: [
+    { id: 'ai',  emoji: '🤖', name: 'Vs Computer', sub: 'You stamp first' },
+    { id: 'two', emoji: '🧑‍🤝‍🧑', name: '2 Players', sub: 'Pass & play' },
+    { id: 'solo', emoji: '🧩', name: 'Solo Puzzle', sub: 'Fill in as many as you can!' },
+  ],
+  onStart,
+});
+
+/* cookie shapes: list of [dr,dc] cells relative to anchor (top-left of footprint). */
+const SHAPES = {
+  '1x1': { name: '1×1 round', emoji: '🍪', cells: [[0,0]], rot: false },
+  '2x1': { name: '2×1 pill',  emoji: '🥮', cells: [[0,0],[0,1]], rot: true },
+  '2x2': { name: '2×2 big',   emoji: '🧁', cells: [[0,0],[0,1],[1,0],[1,1]], rot: false },
+};
+
+function onStart(mode, mount) {
+  const vsAI = mode === 'ai';
+  const solo = mode === 'solo';
+  const AI = 2;
+  let shapeId = MM.load('cc-shape', '1x1');
+  let hard = MM.load('cc-hard', true);
+  let rot = 0;                              // 0 = default orientation, 1 = rotated (for 2x1)
+
+  // board size (kept small so minimax stays exact for the big cookies)
+  const GROWS = 5, GCOLS = 6;
+  let grid;                                 // GROWS*GCOLS, 0 empty else owner (1/2) or 9 (solo)
+  let turn, over, busy, count, soloPlaced;
+
+  const svgNS = 'http://www.w3.org/2000/svg';
+  const boardW = Math.min(460, window.innerWidth - 24);
+  const cell = Math.floor(boardW / GCOLS);
+  const W = cell * GCOLS, H = cell * GROWS;
+
+  const panel = MM.el('div', { class: 'mm-panel mm-center mm-bounce-in' });
+  const optRow = MM.el('div', { class: 'mm-pills', style: { marginBottom: '10px' } });
+
+  const rotBtn = MM.el('button', { class: 'mm-btn small orange', onClick: doRotate }, '🔄 Turn');
+  const rotWrap = MM.el('div', { style: { margin: '2px 0 8px' } }, rotBtn);
+
+  const svg = document.createElementNS(svgNS, 'svg');
+  svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+  svg.style.width = W + 'px'; svg.style.maxWidth = '100%'; svg.style.height = 'auto';
+  svg.style.display = 'block'; svg.style.margin = '2px auto';
+  svg.style.touchAction = 'manipulation';
+  svg.style.borderRadius = '18px';
+
+  const hint = MM.el('div', { class: 'mm-hint' });
+  panel.append(optRow, rotWrap, svg, hint);
+  mount.appendChild(panel);
+
+  function shape() { return SHAPES[shapeId]; }
+  function shapeCells(r, c, useRot) {
+    // returns absolute cells for placing anchor at (r,c) with current rotation
+    const s = shape();
+    let cells = s.cells;
+    if (s.rot && (useRot == null ? rot : useRot)) cells = cells.map(([dr,dc]) => [dc, dr]);
+    return cells.map(([dr,dc]) => [r+dr, c+dc]);
+  }
+
+  function buildPills() {
+    optRow.innerHTML = '';
+    optRow.appendChild(MM.el('span', { class: 'cc-lbl' }, 'Cookie:'));
+    ['1x1','2x1','2x2'].forEach(id => {
+      const s = SHAPES[id];
+      optRow.appendChild(MM.el('button', {
+        class: 'mm-pill', 'aria-pressed': String(id === shapeId),
+        onClick: () => { if (busy) return; MM.sound.play('click'); shapeId = id; rot = 0; MM.store('cc-shape', id); buildPills(); reset(); },
+      }, s.emoji + ' ' + s.name));
+    });
+    if (vsAI) {
+      optRow.appendChild(MM.el('span', { class: 'cc-lbl', style:{marginLeft:'6px'} }, 'Robot:'));
+      [['Easy', false, '🐣'], ['Smart', true, '🧠']].forEach(([name, val, em]) => {
+        optRow.appendChild(MM.el('button', {
+          class: 'mm-pill', 'aria-pressed': String(val === hard),
+          onClick: () => { if (busy) return; MM.sound.play('click'); hard = val; MM.store('cc-hard', val); buildPills(); },
+        }, em + ' ' + name));
+      });
+    }
+    rotWrap.style.display = shape().rot ? 'block' : 'none';
+  }
+
+  function doRotate() {
+    if (busy || !shape().rot) return;
+    rot ^= 1; MM.sound.play('click');
+    hoverRC = null; render();
+  }
+
+  // ---- placement legality ----
+  function idx(r,c){ return r*GCOLS + c; }
+  function fits(cells) {
+    for (const [r,c] of cells) {
+      if (r<0 || c<0 || r>=GROWS || c>=GCOLS) return false;
+      if (grid[idx(r,c)]) return false;
+    }
+    return true;
+  }
+  // all legal anchor placements for the current shape (both rotations if rotatable)
+  function legalPlacements(g) {
+    const s = shape();
+    const rots = s.rot ? [0,1] : [0];
+    const out = [];
+    for (const rr of rots) {
+      for (let r=0;r<GROWS;r++) for (let c=0;c<GCOLS;c++) {
+        let cells = s.cells;
+        if (s.rot && rr) cells = cells.map(([dr,dc]) => [dc,dr]);
+        const abs = cells.map(([dr,dc]) => [r+dr,c+dc]);
+        if (abs.every(([rr2,cc2]) => rr2>=0&&cc2>=0&&rr2<GROWS&&cc2<GCOLS && !g[idx(rr2,cc2)]))
+          out.push({ r, c, rot: rr, cells: abs });
+      }
+    }
+    return out;
+  }
+  function anyMove(g) { return legalPlacements(g).length > 0; }
+
+  // ---- rendering ----
+  let hoverRC = null;      // {r,c} anchor under pointer (for ghost)
+
+  function render() {
+    svg.innerHTML = '';
+    // dough background
+    const bg = document.createElementNS(svgNS,'rect');
+    bg.setAttribute('x',0); bg.setAttribute('y',0); bg.setAttribute('width',W); bg.setAttribute('height',H);
+    bg.setAttribute('rx',18);
+    bg.setAttribute('fill','#e8c187');
+    svg.appendChild(bg);
+    // speckles for dough texture
+    for (let i=0;i<26;i++){
+      const sp = document.createElementNS(svgNS,'circle');
+      sp.setAttribute('cx', (i*97%W)); sp.setAttribute('cy', ((i*57)%H));
+      sp.setAttribute('r', 2 + (i%3)); sp.setAttribute('fill','#d8ab6e'); sp.setAttribute('opacity',0.5);
+      svg.appendChild(sp);
+    }
+    // grid guide lines
+    for (let r=1;r<GROWS;r++){ const l=document.createElementNS(svgNS,'line');
+      l.setAttribute('x1',0); l.setAttribute('y1',r*cell); l.setAttribute('x2',W); l.setAttribute('y2',r*cell);
+      l.setAttribute('stroke','#00000012'); l.setAttribute('stroke-width',2); svg.appendChild(l); }
+    for (let c=1;c<GCOLS;c++){ const l=document.createElementNS(svgNS,'line');
+      l.setAttribute('x1',c*cell); l.setAttribute('y1',0); l.setAttribute('x2',c*cell); l.setAttribute('y2',H);
+      l.setAttribute('stroke','#00000012'); l.setAttribute('stroke-width',2); svg.appendChild(l); }
+
+    // placed cookies: group filled cells by their stamp for a nice rounded blob per cookie.
+    // We stored per-cell owner + a stampId; draw one rounded rect per stamp footprint.
+    for (const st of stamps) {
+      drawStamp(st, 1);
+    }
+
+    // ghost preview
+    if (hoverRC && !over && !busy && !(vsAI && turn === AI)) {
+      const cells = shapeCells(hoverRC.r, hoverRC.c);
+      const ok = fits(cells);
+      drawStampCells(cells, ok ? (solo ? '#2ec4b6' : HEX[turn]) : '#999', 0.4, ok);
+    }
+
+    // clickable overlay per cell (anchor = the cell you tap = top-left of footprint)
+    for (let r=0;r<GROWS;r++) for (let c=0;c<GCOLS;c++) {
+      const rc = document.createElementNS(svgNS,'rect');
+      rc.setAttribute('x', c*cell); rc.setAttribute('y', r*cell);
+      rc.setAttribute('width', cell); rc.setAttribute('height', cell);
+      rc.setAttribute('fill','transparent');
+      if (!over && !busy && !(vsAI && turn===AI)) {
+        rc.style.cursor='pointer';
+        rc.addEventListener('click', () => tryStamp(r,c));
+        rc.addEventListener('pointerenter', () => { hoverRC = {r,c}; render(); });
+        rc.addEventListener('pointerleave', () => { if (hoverRC && hoverRC.r===r && hoverRC.c===c){ hoverRC=null; render(); } });
+      }
+      svg.appendChild(rc);
+    }
+    statusUpdate();
+  }
+
+  function drawStamp(st, opacity) {
+    drawStampCells(st.cells, st.color, opacity, true, st.emoji);
+  }
+  // draw a rounded blob covering the footprint cells + a centered emoji
+  function drawStampCells(cells, color, opacity, solid, emoji) {
+    // bounding box
+    const rs = cells.map(c=>c[0]), cs = cells.map(c=>c[1]);
+    const minr=Math.min(...rs), maxr=Math.max(...rs), minc=Math.min(...cs), maxc=Math.max(...cs);
+    const pad = cell*0.10;
+    const x = minc*cell + pad, y = minr*cell + pad;
+    const w = (maxc-minc+1)*cell - pad*2, h = (maxr-minr+1)*cell - pad*2;
+    const rect = document.createElementNS(svgNS,'rect');
+    rect.setAttribute('x',x); rect.setAttribute('y',y); rect.setAttribute('width',w); rect.setAttribute('height',h);
+    rect.setAttribute('rx', Math.min(w,h)/2.4);
+    rect.setAttribute('fill', color);
+    rect.setAttribute('opacity', opacity);
+    if (!solid) { rect.setAttribute('stroke', color); rect.setAttribute('stroke-width', 3); rect.setAttribute('stroke-dasharray','7 5'); rect.setAttribute('fill', color); rect.setAttribute('fill-opacity', 0.25); }
+    if (solid) rect.setAttribute('class','cc-cookie');
+    svg.appendChild(rect);
+    // emoji in the middle
+    const t = document.createElementNS(svgNS,'text');
+    t.setAttribute('x', x + w/2); t.setAttribute('y', y + h/2 + 1);
+    t.setAttribute('text-anchor','middle'); t.setAttribute('dominant-baseline','central');
+    t.setAttribute('font-size', Math.min(w,h) * 0.62);
+    t.style.pointerEvents='none';
+    t.textContent = emoji || shape().emoji;
+    svg.appendChild(t);
+  }
+
+  function statusUpdate() {
+    if (over) return;
+    if (solo) {
+      MM.status(`<span class="chip" style="background:#2ec4b6">Cookies stamped: ${soloPlaced} 🍪</span>`);
+      hint.textContent = anyMove(grid) ? 'Fill the whole sheet if you can!' : '';
+      return;
+    }
+    const who = vsAI ? (turn===AI ? '🤖 Computer…' : '🧒 Your turn') : ('Player ' + turn);
+    MM.status(`<span class="chip" style="background:${HEX[turn]}">${who}</span>`);
+    if (vsAI && turn === AI) hint.textContent = 'The computer is choosing a spot…';
+    else hint.textContent = 'Tap the dough to stamp your ' + shape().name + ' cookie.';
+  }
+
+  // ---- interaction ----
+  let stamps = [];         // { cells:[[r,c]...], color, emoji }
+
+  function tryStamp(r, c) {
+    if (over || busy) return;
+    if (vsAI && turn === AI) return;
+    const cells = shapeCells(r, c);
+    if (!fits(cells)) { MM.sound.play('wrong'); return; }
+    place(cells, solo ? 9 : turn);
+  }
+
+  function place(cells, owner) {
+    const emoji = shape().emoji;
+    const color = solo ? '#2ec4b6' : HEX[turn];
+    for (const [r,c] of cells) grid[idx(r,c)] = owner;
+    stamps.push({ cells: cells.map(x=>x.slice()), color, emoji });
+    MM.sound.play('pop');
+    hoverRC = null;
+    render();
+    popAnim();
+
+    if (solo) {
+      soloPlaced++;
+      if (!anyMove(grid)) { soloEnd(); return; }
+      render();
+      return;
+    }
+    // did that fill the sheet for the next player?
+    const mover = turn;
+    turn = turn === 1 ? 2 : 1;
+    if (!anyMove(grid)) { endGame(mover); return; }   // next player can't move => the MOVER (last stamp) wins
+    render();
+    if (vsAI && turn === AI) { busy = true; statusUpdate(); setTimeout(aiTurn, 480); }
+  }
+
+  function popAnim() {
+    const last = svg.querySelectorAll('.cc-cookie');
+    const el = last[last.length-1];
+    if (el) el.animate([{ transform:'scale(0.2)' },{ transform:'scale(1.12)' },{ transform:'scale(1)' }],
+      { duration: 260, easing:'cubic-bezier(.2,1.4,.4,1)', transformOrigin:'center' });
+  }
+
+  // ---- AI ----
+  function aiTurn() {
+    if (over) return;
+    const moves = legalPlacements(grid);
+    if (moves.length === 0) { endGame(1); return; }   // AI can't move => human (last) wins
+    let pick;
+    if (!hard && Math.random() < 0.5) {
+      pick = MM.choice(moves);
+    } else {
+      pick = smartMove(moves);
+    }
+    // apply as AI
+    const cells = pick.cells;
+    const emoji = shape().emoji;
+    for (const [r,c] of cells) grid[idx(r,c)] = AI;
+    stamps.push({ cells: cells.map(x=>x.slice()), color: HEX[AI], emoji });
+    MM.sound.play('pop');
+    busy = false;
+    render(); popAnim();
+    const mover = AI;
+    turn = 1;
+    if (!anyMove(grid)) { endGame(mover); return; }
+    render();
+  }
+
+  // Winning-move search. 1x1 => parity. Otherwise memoized minimax with node budget.
+  function smartMove(moves) {
+    if (shapeId === '1x1') {
+      // Every 1x1 fills exactly one cell; total moves = number of empties. Last mover wins.
+      // If empties is even, the player to move (AI) loses with perfect play; any move is equal.
+      // Just play anywhere (all equivalent) but prefer center for looks.
+      return moves.slice().sort((a,b)=>dist2center(b)-dist2center(a)).pop();
+    }
+    // 2x1 / 2x2 minimax
+    const memo = new Map();
+    let nodes = 0;
+    const BUDGET = 45000;                   // keeps "thinking" snappy (<~0.5s); exact once
+                                            // the remaining subtree fits, heuristic if huge.
+    // grid as bitmask (GROWS*GCOLS <= 30 bits)
+    function toMask(g){ let m=0; for(let i=0;i<g.length;i++) if(g[i]) m|=(1<<i); return m; }
+    function movesForMask(mask){
+      const g = new Array(GROWS*GCOLS).fill(0);
+      for(let i=0;i<g.length;i++) if(mask&(1<<i)) g[i]=1;
+      return legalPlacements(g);
+    }
+    // returns true if the player TO MOVE wins from this mask (last-move-wins, no draws)
+    function win(mask){
+      if (memo.has(mask)) return memo.get(mask);
+      nodes++;
+      const mv = movesForMask(mask);
+      if (mv.length === 0) { memo.set(mask,false); return false; }  // to-move can't move => loses
+      if (nodes > BUDGET) {
+        // heuristic fallback: parity of a maximal greedy packing (mobility parity)
+        const h = (mv.length % 2 === 1);
+        return h;
+      }
+      let res = false;
+      for (const m of mv) {
+        let nm = mask; for (const [r,c] of m.cells) nm |= (1<<idx(r,c));
+        if (!win(nm)) { res = true; break; }        // opponent loses => we win
+      }
+      memo.set(mask, res);
+      return res;
+    }
+    const baseMask = toMask(grid);
+    // find a move leading to a lost position for opponent
+    let winning = null, fallback = moves[0], bestMob = Infinity;
+    for (const m of MM.shuffle(moves.slice())) {
+      let nm = baseMask; for (const [r,c] of m.cells) nm |= (1<<idx(r,c));
+      if (!win(nm)) { winning = m; break; }
+      // track a fallback that minimizes opponent mobility (makes them run out sooner)
+      const mob = movesForMask(nm).length;
+      if (mob < bestMob) { bestMob = mob; fallback = m; }
+      if (nodes > BUDGET) break;
+    }
+    return winning || fallback;
+  }
+  function dist2center(m){ const cr=(GROWS-1)/2, cc=(GCOLS-1)/2; const r=m.cells[0][0], c=m.cells[0][1]; return (r-cr)*(r-cr)+(c-cc)*(c-cc); }
+
+  // ---- end ----
+  function endGame(winner) {
+    over = true; busy = false; hoverRC = null;
+    render();
+    MM.sound.play('ding');
+    if (vsAI) {
+      const youWin = winner !== AI;
+      MM.win({ lose: !youWin, title: youWin ? 'You win! 🎉' : 'Computer wins!',
+        emoji: youWin ? '🏆' : '🤖',
+        sub: (youWin ? 'You' : 'The computer') + ' stamped the last cookie!',
+        onAgain: () => MM.toMenu() });
+    } else {
+      MM.win({ title: 'Player ' + winner + ' wins! 🎉', emoji: winner === 1 ? '🔵' : '🔴',
+        sub: 'Stamped the very last cookie! 🍪', onAgain: () => MM.toMenu() });
+    }
+  }
+  function soloEnd() {
+    over = true;
+    const total = GROWS*GCOLS;
+    const filled = grid.filter(v=>v).length;
+    const perfect = filled === total;
+    render();
+    MM.win({ lose: false,
+      title: perfect ? 'Perfect sheet! 🎉' : 'No more room!',
+      emoji: perfect ? '🏆' : '🍪',
+      sub: 'You stamped ' + soloPlaced + ' cookies and filled ' + filled + ' of ' + total + ' spaces.',
+      onAgain: () => MM.toMenu() });
+  }
+
+  function reset() {
+    grid = new Array(GROWS*GCOLS).fill(0);
+    stamps = [];
+    turn = 1; over = false; busy = false; hoverRC = null; soloPlaced = 0;
+    render();
+    // human always stamps first; AI (P2) never starts.
+  }
+
+  buildPills();
+  reset();
+}
+</script>
+<style>
+  .cc-lbl { font-weight: 800; align-self: center; color: var(--ink-soft); font-size: 15px; }
+  .cc-cookie { filter: drop-shadow(0 3px 0 rgba(0,0,0,.12)); }
+  svg text { user-select: none; }
+</style>
+</body>
+</html>

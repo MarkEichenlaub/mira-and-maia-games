@@ -1,0 +1,447 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Speed</title>
+<link rel="stylesheet" href="../../assets/common.css">
+<style>
+  .sp-board { display: flex; flex-direction: column; align-items: center; gap: 8px; }
+  .sp-row { display: flex; gap: 8px; justify-content: center; align-items: center; flex-wrap: wrap; }
+  .sp-pile { position: relative; }
+  /* playable-card glow */
+  .sp-playable { outline: 4px solid var(--c-green); box-shadow: 0 0 0 4px #2ec4b655, var(--shadow); animation: sp-glow 1s ease-in-out infinite; }
+  @keyframes sp-glow { 0%,100%{ transform: translateY(0) } 50%{ transform: translateY(-6px) } }
+  .sp-play-pile { border: 4px solid var(--c-yellow) !important; }
+  .sp-play-pile.sp-target { outline: 4px dashed var(--c-orange); }
+  .sp-just { animation: sp-drop .28s cubic-bezier(.3,1.4,.5,1); }
+  @keyframes sp-drop { from { transform: scale(1.3) translateY(-18px); opacity:.4 } to { transform: scale(1) translateY(0); opacity:1 } }
+  .sp-stock { opacity: .95; }
+</style>
+</head>
+<body>
+<script src="../../assets/common.js"></script>
+<script>
+/* SPEED — fast, real-time, no turns. Deck 0..20.
+   Two center "play piles" (each starts from a flipped card). Each player has a
+   draw pile + a hand of up to 5. Play a hand card onto a play pile if it is
+   exactly 1 more, 1 less, 10 more, or 10 less than that pile's top card. After
+   playing, draw back up to 5. If BOTH players are stuck, each flips a card from
+   their stock onto the two play piles to unstick. First to empty their draw
+   pile AND hand wins.
+
+   AI: scans for any legal play and makes it after a human-fair reaction delay
+   (Easy/Medium/Fast pill). Never plays illegally; always draws back up.
+   SOLO: race the clock to clear your pile; flip your own unstick cards. */
+
+const HEX = { 1: '#3a86ff', 2: '#ff5a5f' };
+const DELAY = { easy: [1500, 2400], medium: [900, 1600], fast: [550, 1000] };
+
+MM.game({
+  title: 'Speed', emoji: '⚡',
+  ba: 'https://beastacademy.com/playground/speed',
+  rules: `
+    <p><b>Be the fastest — no taking turns!</b> ⚡ Play as quick as you can.</p>
+    <ol>
+      <li>There are <b>two piles</b> in the middle. You have a <b>hand of 5 cards</b>.</li>
+      <li>Play a card on a pile if it is <b>1 more, 1 less, 10 more, or 10 less</b>
+          than the top card. (So on a <b>7</b> you can play 6, 8, 17… or nothing.)</li>
+      <li>Playable cards <b>glow green</b> ✨. Tap a glowing card, then tap a pile.</li>
+      <li>After you play, you fill your hand back up to 5.</li>
+      <li><b>Stuck?</b> If nobody can play, tap <b>Flip!</b> to turn new cards onto both piles.</li>
+      <li>First to run <b>completely out of cards wins</b> 🏆</li>
+    </ol>
+    <p>No waiting for the other player — just go, go, go!</p>`,
+  modes: [
+    { id: 'ai',   emoji: '🤖', name: 'Vs Computer', sub: 'Race the robot!' },
+    { id: 'solo', emoji: '⏱️', name: 'Solo Race',    sub: 'Beat the clock!' },
+  ],
+  onStart,
+});
+
+function onStart(mode, mount) {
+  const vsAI = (mode === 'ai');
+  let difficulty = 'medium';
+
+  // ---- state ----
+  let piles = [null, null];             // two play piles: top value shown
+  let draw = { 1: [], 2: [] };          // draw piles (also feed unstick flips)
+  let hand = { 1: [], 2: [] };          // hands (up to 5)
+  let dealt = false;                    // have the 2 center piles been flipped yet
+  let sel = null;                       // human-selected hand index
+  let over = false;
+  let aiTimer = null;
+  let startTime = 0, soloTimerId = null;
+
+  const panel = MM.el('div', { class: 'mm-panel mm-center mm-bounce-in' });
+  mount.appendChild(panel);
+
+  function label(pl) { return pl === 1 ? 'You' : 'Computer'; }
+
+  // ---- deck: 0..20, three of each (63 cards) ----
+  function newDeck() {
+    const d = [];
+    for (let v = 0; v <= 20; v++) for (let k = 0; k < 3; k++) d.push(v);
+    return MM.shuffle(d);
+  }
+
+  // ---- legality: card c on pile top t ----
+  function legal(c, t) {
+    if (t == null) return false;
+    const d = Math.abs(c - t);
+    return d === 1 || d === 10;
+  }
+  function anyLegal(pl) {
+    return hand[pl].some(c => legal(c, piles[0]) || legal(c, piles[1]));
+  }
+
+  // ---- difficulty pill (ai only) ----
+  function diffPills() {
+    if (!vsAI) return null;
+    const wrap = MM.el('div', { class: 'mm-pills', style: { marginBottom: '8px' } });
+    [['easy', '🐢 Easy'], ['medium', '🐇 Medium'], ['fast', '⚡ Fast']].forEach(([id, name]) => {
+      wrap.appendChild(MM.el('button', {
+        class: 'mm-pill', 'aria-pressed': difficulty === id ? 'true' : 'false',
+        onClick: () => { if (difficulty === id) return; MM.sound.play('pop'); difficulty = id; render(); scheduleAI(); },
+      }, name));
+    });
+    return wrap;
+  }
+
+  function scorebar() {
+    const bar = MM.el('div', { class: 'mm-scorebar' });
+    bar.appendChild(MM.el('div', { class: 'mm-score' },
+      MM.el('span', { class: 'dot', style: { background: HEX[1] } }),
+      MM.el('span', {}, label(1) + ': ' + (draw[1].length + hand[1].length) + ' left')));
+    if (vsAI) {
+      bar.appendChild(MM.el('div', { class: 'mm-score' },
+        MM.el('span', { class: 'dot', style: { background: HEX[2] } }),
+        MM.el('span', {}, label(2) + ': ' + (draw[2].length + hand[2].length) + ' left')));
+    } else {
+      bar.appendChild(MM.el('div', { class: 'mm-score', id: 'sp-clock' },
+        MM.el('span', {}, '⏱️ 0.0s')));
+    }
+    return bar;
+  }
+
+  // ---- card element ----
+  function cardEl(v, opts) {
+    opts = opts || {};
+    const c = MM.card(opts.back ? '' : v, { back: !!opts.back, color: opts.color });
+    if (opts.big) { c.style.width = '70px'; c.style.height = '98px'; c.style.fontSize = '36px'; }
+    if (opts.cls) c.classList.add(opts.cls);
+    if (opts.sel) c.classList.add('sel');
+    if (opts.on) { c.style.cursor = 'pointer'; c.addEventListener('click', opts.on); }
+    return c;
+  }
+
+  // ================= render =================
+  function render(msg) {
+    if (over) return;
+    panel.innerHTML = '';
+    const dp = diffPills(); if (dp) panel.appendChild(dp);
+    panel.appendChild(scorebar());
+
+    const board = MM.el('div', { class: 'sp-board' });
+
+    // Opponent hand (ai) — face-down row on top
+    if (vsAI) {
+      const oppRow = MM.el('div', { class: 'sp-row' });
+      oppRow.appendChild(MM.el('div', { style: { fontWeight: '800', color: HEX[2], marginRight: '6px' } }, 'Computer'));
+      for (let i = 0; i < hand[2].length; i++) oppRow.appendChild(smallBack());
+      board.appendChild(oppRow);
+    }
+
+    // Center: two play piles + stock decks
+    const mid = MM.el('div', { class: 'sp-row', style: { margin: '6px 0' } });
+    // player draw pile (left, tappable to fill hand if room? auto — show count)
+    mid.appendChild(deckStack(draw[1].length, HEX[1], 'Your pile'));
+    // two play piles
+    for (let p = 0; p < 2; p++) {
+      const top = piles[p];
+      const el = (top == null)
+        ? MM.el('div', { class: 'sp-play-pile', style: playPlaceStyle() }, '?')
+        : cardEl(top, { big: true, cls: 'sp-play-pile', color: '#22223b',
+            on: (sel != null) ? () => tryPlayHuman(p) : null });
+      if (sel != null && legal(hand[1][sel], top)) el.classList.add('sp-target');
+      el.classList.add('sp-just-holder');
+      mid.appendChild(el);
+    }
+    // opponent draw pile (right) — ai only
+    if (vsAI) mid.appendChild(deckStack(draw[2].length, HEX[2], 'Robot pile'));
+    board.appendChild(mid);
+
+    // Flip / stuck button.
+    // Stuck when nobody has a legal play. Unstick flips from draw piles.
+    const stuck = dealt && !anyLegal(1) && (vsAI ? !anyLegal(2) : true);
+    const canReset = !vsAI && draw[1].length === 0 && hand[1].length > 0; // solo free-reset
+    const canFlip = !dealt
+      ? (draw[1].length >= 1)
+      : (stuck && (draw[1].length > 0 || (vsAI && draw[2].length > 0) || canReset));
+    const flipBtn = MM.el('button', {
+      class: 'mm-btn ' + ((!dealt || stuck) ? 'orange' : 'ghost'),
+      style: { fontSize: '18px', padding: '12px 22px', minHeight: '50px', margin: '6px 0' },
+      onClick: flip,
+    }, !dealt ? '🃏 Deal the piles!' : (canReset && stuck ? '🔀 Reset a pile!' : '🔄 Flip! (unstick)'));
+    flipBtn.disabled = !canFlip;
+    board.appendChild(flipBtn);
+
+    // Your hand
+    const handRow = MM.el('div', { class: 'sp-row' });
+    handRow.appendChild(MM.el('div', { style: { fontWeight: '800', color: HEX[1], marginRight: '6px' } }, 'Your hand'));
+    hand[1].forEach((v, i) => {
+      const playable = legal(v, piles[0]) || legal(v, piles[1]);
+      handRow.appendChild(cardEl(v, {
+        color: HEX[1], sel: sel === i,
+        cls: playable ? 'sp-playable' : null,
+        on: () => pickHand(i),
+      }));
+    });
+    board.appendChild(handRow);
+
+    panel.appendChild(board);
+    if (msg) panel.appendChild(MM.el('div', { class: 'mm-hint', style: { fontSize: '16px', marginTop: '6px' }, html: msg }));
+    else if (stuck) panel.appendChild(MM.el('div', { class: 'mm-hint', style: { fontSize: '16px' }, html: '😬 Stuck! Tap <b>Flip!</b> to turn over new cards.' }));
+  }
+
+  function smallBack() {
+    const c = MM.card('', { back: true });
+    c.style.width = '34px'; c.style.height = '48px';
+    return c;
+  }
+  function deckStack(n, color, name) {
+    const wrap = MM.el('div', { style: { display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '2px' } });
+    const c = n > 0 ? MM.card('', { back: true }) : MM.el('div', { style: playPlaceStyle() }, '∅');
+    c.style.width = '52px'; c.style.height = '74px';
+    if (n > 0) c.classList.add('sp-stock');
+    wrap.appendChild(c);
+    wrap.appendChild(MM.el('div', { class: 'mm-hint', style: { margin: '0', fontSize: '13px', color } }, (name ? name + ' ' : '') + '(' + n + ')'));
+    return wrap;
+  }
+  function playPlaceStyle() {
+    return {
+      width: '70px', height: '98px', borderRadius: '12px', border: '4px dashed #d7cfe6',
+      display: 'inline-flex', alignItems: 'center', justifyContent: 'center', fontSize: '30px', color: '#c3bad4',
+    };
+  }
+
+  // ================= human input =================
+  function pickHand(i) {
+    if (over) return;
+    const v = hand[1][i];
+    const playable = legal(v, piles[0]) || legal(v, piles[1]);
+    if (!playable) {
+      // not playable — gentle feedback, but still allow selecting to show
+      MM.sound.play('wrong');
+      sel = null;
+      render('That <b>' + v + '</b> can’t go on either pile. Tap a <span style="color:#2ec4b6">glowing</span> card!');
+      return;
+    }
+    MM.sound.play('click');
+    sel = i;
+    // auto-play if only one legal pile, else prompt to pick a pile
+    const l0 = legal(v, piles[0]), l1 = legal(v, piles[1]);
+    if (l0 && !l1) { tryPlayHuman(0); return; }
+    if (l1 && !l0) { tryPlayHuman(1); return; }
+    render('Now tap the <b>pile</b> you want to play the <b>' + v + '</b> on! 👇');
+  }
+
+  function tryPlayHuman(p) {
+    if (over || sel == null) return;
+    const v = hand[1][sel];
+    if (!legal(v, piles[p])) { MM.sound.play('wrong'); return; }
+    const idx = sel;
+    sel = null;                          // clear selection before re-render
+    playCard(1, idx, p);
+  }
+
+  // ================= play a card =================
+  function playCard(pl, handIdx, pileIdx) {
+    const v = hand[pl][handIdx];
+    hand[pl].splice(handIdx, 1);
+    piles[pileIdx] = v;
+    MM.sound.play('place'); MM.sound.play('pop');
+    // draw back up to 5
+    fillHand(pl);
+    render();
+    // animate the just-played pile
+    flashPile(pileIdx);
+    checkWin();
+    if (!over) scheduleAI();
+  }
+
+  function fillHand(pl) {
+    while (hand[pl].length < 5 && draw[pl].length > 0) hand[pl].push(draw[pl].pop());
+  }
+
+  function flashPile(pileIdx) {
+    const piles2 = panel.querySelectorAll('.sp-play-pile');
+    const el = piles2[pileIdx];
+    if (el) { el.classList.add('sp-just'); setTimeout(() => el.classList.remove('sp-just'), 300); }
+  }
+
+  // ================= flip / unstick =================
+  function flip() {
+    if (over) return;
+    // initial deal: seed the two play piles from the draw pile(s)
+    if (!dealt) {
+      // pile 0 from player 1, pile 1 from player 2 (solo: both from player 1)
+      if (draw[1].length) piles[0] = draw[1].pop();
+      if (vsAI) { if (draw[2].length) piles[1] = draw[2].pop(); }
+      else { if (draw[1].length) piles[1] = draw[1].pop(); }
+      dealt = true;
+      MM.sound.play('deal');
+      render('Go! Play a glowing card. ⚡');
+      flashPile(0); flashPile(1);
+      scheduleAI();
+      return;
+    }
+    // real unstick: only when everyone is stuck
+    if (anyLegal(1) || (vsAI && anyLegal(2))) return;
+
+    if (vsAI) {
+      // each player flips one card from their own draw pile onto a play pile
+      let flipped = false;
+      if (draw[1].length) { piles[0] = draw[1].pop(); flipped = true; }
+      if (draw[2].length) { piles[1] = draw[2].pop(); flipped = true; }
+      if (!flipped) { endStalemate(); return; }
+    } else {
+      // solo: flip from draw pile onto both piles; if draw is empty, free-reset
+      // by placing a stuck hand card so the race is always finishable.
+      if (draw[1].length >= 2) { piles[0] = draw[1].pop(); piles[1] = draw[1].pop(); }
+      else if (draw[1].length === 1) { piles[0] = draw[1].pop(); }
+      else if (hand[1].length) {
+        // free reset: drop the lowest hand card onto a pile
+        let lo = 0; for (let i = 1; i < hand[1].length; i++) if (hand[1][i] < hand[1][lo]) lo = i;
+        piles[0] = hand[1][lo]; hand[1].splice(lo, 1); fillHand(1);
+      } else { endStalemate(); return; }
+    }
+    MM.sound.play('swoosh'); MM.sound.play('deal');
+    render('🔄 New cards! Look for a glowing play. ⚡');
+    flashPile(0); flashPile(1);
+    checkWin();
+    if (!over) scheduleAI();
+    // if STILL stuck and nothing left to flip → resolve by fewest cards
+    if (!over && !anyLegal(1) && (vsAI ? !anyLegal(2) : true) &&
+        draw[1].length === 0 && (!vsAI ? hand[1].length === 0 : draw[2].length === 0)) {
+      endStalemate();
+    }
+  }
+
+  // ================= AI =================
+  function scheduleAI() {
+    if (!vsAI || over) return;
+    if (aiTimer) { clearTimeout(aiTimer); aiTimer = null; }
+    if (!dealt) return;                     // wait for deal
+    // find a legal AI play
+    if (!aiHasPlay()) return;               // nothing to do now
+    const [lo, hi] = DELAY[difficulty];
+    aiTimer = setTimeout(aiMove, MM.range(lo, hi));
+  }
+  function aiHasPlay() {
+    return hand[2].some(c => legal(c, piles[0]) || legal(c, piles[1]));
+  }
+  function aiMove() {
+    aiTimer = null;
+    if (over || !dealt) return;
+    // pick a legal (handIdx, pileIdx)
+    let choice = null;
+    for (let i = 0; i < hand[2].length; i++) {
+      for (let p = 0; p < 2; p++) {
+        if (legal(hand[2][i], piles[p])) { choice = [i, p]; break; }
+      }
+      if (choice) break;
+    }
+    if (!choice) return;                    // safety: never illegal
+    playCard(2, choice[0], choice[1]);
+    // keep going if the AI still has plays (schedule next)
+  }
+
+  // ================= win / end =================
+  function checkWin() {
+    if (over) return;
+    for (const pl of (vsAI ? [1, 2] : [1])) {
+      if (draw[pl].length === 0 && hand[pl].length === 0) { finish(pl); return; }
+    }
+  }
+  function finish(winner) {
+    over = true;
+    if (aiTimer) clearTimeout(aiTimer);
+    if (soloTimerId) clearInterval(soloTimerId);
+    if (vsAI) {
+      const youWin = winner === 1;
+      MM.win({ lose: !youWin, title: youWin ? 'You win! ⚡🎉' : 'Computer wins!',
+        emoji: youWin ? '🏆' : '🤖',
+        sub: youWin ? 'Lightning fast!' : 'So close — try Easy speed!',
+        onAgain: () => MM.toMenu() });
+    } else {
+      const secs = ((Date.now() - startTime) / 1000).toFixed(1);
+      MM.win({ title: 'Cleared it! ⚡🎉', emoji: '🏆',
+        sub: 'You cleared your pile in ' + secs + ' seconds!',
+        onAgain: () => MM.toMenu() });
+    }
+  }
+  function endStalemate() {
+    over = true;
+    if (aiTimer) clearTimeout(aiTimer);
+    if (soloTimerId) clearInterval(soloTimerId);
+    if (!vsAI) {
+      MM.win({ lose: true, title: 'All stuck!', emoji: '😅',
+        sub: 'No more moves. Shuffle up and try again!', onAgain: () => MM.toMenu() });
+      return;
+    }
+    const c1 = draw[1].length + hand[1].length, c2 = draw[2].length + hand[2].length;
+    const winner = c1 < c2 ? 1 : c2 < c1 ? 2 : 0;
+    if (winner === 0) {
+      MM.win({ title: "It’s a tie! 🤝", emoji: '⚡', sub: 'Everyone’s stuck with the same count.', onAgain: () => MM.toMenu() });
+    } else {
+      const youWin = winner === 1;
+      MM.win({ lose: !youWin, title: youWin ? 'You win! ⚡' : 'Computer wins!',
+        emoji: youWin ? '🏆' : '🤖',
+        sub: 'Both stuck — fewer cards wins. You: ' + c1 + ', Computer: ' + c2 + '.',
+        onAgain: () => MM.toMenu() });
+    }
+  }
+
+  // ================= deal & start =================
+  async function deal() {
+    over = false;
+    const deck = newDeck();
+    piles = [null, null];
+    draw = { 1: [], 2: [] };
+    hand = { 1: [], 2: [] };
+    dealt = false;
+    sel = null;
+
+    if (vsAI) {
+      // split evenly into both players' draw piles
+      deck.forEach((v, i) => draw[i % 2 === 0 ? 1 : 2].push(v));
+    } else {
+      deck.forEach(v => draw[1].push(v));
+    }
+    // fill starting hands from own draw piles
+    fillHand(1); if (vsAI) fillHand(2);
+
+    // deal animation
+    MM.status('<span class="chip" style="background:#ff9f1c">' +
+      (vsAI ? 'Vs Computer ⚡' : 'Solo race ⏱️') + '</span>');
+    render('Dealing… 🎴');
+    for (let i = 0; i < 5; i++) { MM.sound.play('deal'); await MM.sleep(150); render('Dealing… 🎴'); }
+
+    // start the clock (solo)
+    startTime = Date.now();
+    if (!vsAI) {
+      soloTimerId = setInterval(() => {
+        const clk = document.getElementById('sp-clock');
+        if (clk && !over) clk.innerHTML = '<span>⏱️ ' + ((Date.now() - startTime) / 1000).toFixed(1) + 's</span>';
+      }, 100);
+    }
+
+    render('Tap <b>Deal the piles!</b> to flip the two center cards. 🃏');
+  }
+
+  deal();
+}
+</script>
+</body>
+</html>

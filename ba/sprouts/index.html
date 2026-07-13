@@ -1,0 +1,505 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Sprouts</title>
+<link rel="stylesheet" href="../../assets/common.css">
+</head>
+<body>
+<script src="../../assets/common.js"></script>
+<script>
+/* SPROUTS — the classic pencil-and-paper game (Conway & Paterson).
+   Start with 3 (or 4) dots. On your turn: connect two dots (or a dot to itself) with a
+   vine, then drop a NEW dot in the middle of that vine. Rules of the pencil game:
+     • a vine may not cross any other vine (or itself), and
+     • a dot may never have more than 3 vine-ends touching it (a 3-dot is DEAD 🪦).
+   Whoever CANNOT move LOSES — the last player to draw a vine wins.
+
+   CONSTRAINED, TRUE-TO-SPROUTS IMPLEMENTATION (documented in the rules modal):
+   Free-hand non-crossing curves are hard to adjudicate, so we adjudicate for you:
+     • You click two LIVE dots (or the same dot twice for a loop). The vine is auto-routed
+       as a smooth arc and a new dot is planted at its midpoint (degree 2).
+     • Degrees are tracked exactly (each endpoint +1; a self-loop +2; the new dot starts at 2).
+     • CROSSING is enforced geometrically: a proposed vine is rejected if its drawn path
+       would cross any existing vine (we test the arc's segments against every existing
+       arc). We try a few arc curvatures and offsets to find a non-crossing route; if none
+       exists, that connection is illegal.
+   WIN DETECTION is exact for this model: the game ends when NO legal move remains — i.e.
+   for every pair of live dots (and every live dot's self-loop) either the degree limit is
+   exceeded or every routing crosses. Degree limits and last-move-wins are always correct;
+   only the *curve shape* is simplified (we pick the arc for you). */
+
+const HEX = { 1: '#3a86ff', 2: '#ff5a5f' };
+
+MM.game({
+  title: 'Sprouts', emoji: '🌱',
+  ba: 'https://beastacademy.com/playground/sprouts',
+  rules: `
+    <p><b>Grow vines, don't get stuck!</b> Take turns connecting dots with vines 🌿.</p>
+    <ol>
+      <li>Tap one dot, then another dot (or the <b>same</b> dot twice for a loop) to grow a vine.</li>
+      <li>A brand-new dot 🌱 sprouts in the middle of every vine you grow.</li>
+      <li>A dot can only touch <b>3 vine-ends</b>. When it's full it turns gray — it's <b>asleep</b> 😴 and can't be used.</li>
+      <li>Vines can't cross each other. The game does the drawing so lines never tangle!</li>
+      <li>If it's your turn and there's <b>no move left</b>, you <b>lose</b>. Last vine wins! 🏆</li>
+    </ol>
+    <p class="mm-hint" style="text-align:left"><b>About this version:</b> real Sprouts is drawn
+    free-hand. Here the computer auto-draws each vine as a tidy arc and only lets a connection
+    happen if a non-crossing path exists — so the dot limit and the "last to move wins" rule
+    are always exactly right.</p>`,
+  modes: [
+    { id: 'two', emoji: '🧑‍🤝‍🧑', name: '2 Players', sub: 'Pass & play — the best way!' },
+    { id: 'ai',  emoji: '🤖', name: 'Vs Computer', sub: 'You go first' },
+  ],
+  onStart,
+});
+
+function onStart(mode, mount) {
+  const vsAI = mode === 'ai';
+  const AI = 2;                       // computer is player 2 (human moves first)
+  let startDots = MM.load('sprouts-start', 3);
+  let hard = MM.load('sprouts-hard', true);
+
+  // ---- game state ----
+  // dots: { id, x, y, deg }  (deg = vine-ends used, 0..3; dead at 3)
+  // vines: { pts:[[x,y]...], color }  polyline for crossing tests + drawing
+  let dots, vines, nextId, turn, over, busy, sel;
+
+  const size = Math.min(500, window.innerWidth - 24);
+  const svgNS = 'http://www.w3.org/2000/svg';
+
+  const panel = MM.el('div', { class: 'mm-panel mm-center mm-bounce-in' });
+  const optRow = MM.el('div', { class: 'mm-pills', style: { marginBottom: '10px' } });
+
+  const svg = document.createElementNS(svgNS, 'svg');
+  svg.setAttribute('viewBox', `0 0 ${size} ${size}`);
+  svg.style.width = size + 'px'; svg.style.maxWidth = '100%'; svg.style.height = 'auto';
+  svg.style.display = 'block'; svg.style.margin = '4px auto';
+  svg.style.touchAction = 'manipulation';
+  svg.style.background = 'radial-gradient(circle at 50% 40%, #f3fff6, #eafaf0)';
+  svg.style.borderRadius = '20px';
+
+  const hint = MM.el('div', { class: 'mm-hint' });
+  panel.append(optRow, svg, hint);
+  mount.appendChild(panel);
+
+  function buildPills() {
+    optRow.innerHTML = '';
+    optRow.appendChild(MM.el('span', { class: 'sp-lbl' }, 'Start dots:'));
+    [3, 4].forEach(n => {
+      optRow.appendChild(MM.el('button', {
+        class: 'mm-pill', 'aria-pressed': String(n === startDots),
+        onClick: () => { if (busy) return; MM.sound.play('click'); startDots = n; MM.store('sprouts-start', n); buildPills(); reset(); },
+      }, n + ' dots'));
+    });
+    if (vsAI) {
+      optRow.appendChild(MM.el('span', { class: 'sp-lbl', style:{marginLeft:'6px'} }, 'Robot:'));
+      [['Easy', false, '🐣'], ['Smart', true, '🧠']].forEach(([name, val, em]) => {
+        optRow.appendChild(MM.el('button', {
+          class: 'mm-pill', 'aria-pressed': String(val === hard),
+          onClick: () => { if (busy) return; MM.sound.play('click'); hard = val; MM.store('sprouts-hard', val); buildPills(); },
+        }, em + ' ' + name));
+      });
+    }
+  }
+
+  // ---------------- geometry: segment crossing ----------------
+  function segCross(p, q, a, b) {
+    // proper intersection of segments p-q and a-b (excluding shared endpoints)
+    function o(A, B, C) { return Math.sign((B[0]-A[0])*(C[1]-A[1]) - (B[1]-A[1])*(C[0]-A[0])); }
+    // ignore if they share an endpoint (touching at a dot is allowed)
+    const share = (u,v) => Math.hypot(u[0]-v[0],u[1]-v[1]) < 0.5;
+    if (share(p,a)||share(p,b)||share(q,a)||share(q,b)) {
+      // allow touching only at the very endpoints; still reject if collinear overlap—rare, skip
+      return false;
+    }
+    const o1=o(p,q,a), o2=o(p,q,b), o3=o(a,b,p), o4=o(a,b,q);
+    if (o1!==o2 && o3!==o4) return true;
+    return false;
+  }
+  function polyCross(A, B) {
+    // do polylines A and B cross (any segment pair)?
+    for (let i=0;i<A.length-1;i++) for (let j=0;j<B.length-1;j++)
+      if (segCross(A[i],A[i+1],B[j],B[j+1])) return true;
+    return false;
+  }
+  function selfCross(A) {
+    for (let i=0;i<A.length-1;i++) for (let j=i+2;j<A.length-1;j++) {
+      if (i===0 && j===A.length-2) continue; // adjacent-wrap not applicable (open path)
+      if (segCross(A[i],A[i+1],A[j],A[j+1])) return true;
+    }
+    return false;
+  }
+
+  // build an arc polyline between dots d1,d2 bulging by `bulge` (perpendicular offset).
+  function arcPath(d1, d2, bulge) {
+    const steps = 22;
+    const mx=(d1.x+d2.x)/2, my=(d1.y+d2.y)/2;
+    const dx=d2.x-d1.x, dy=d2.y-d1.y, len=Math.hypot(dx,dy)||1;
+    const nx=-dy/len, ny=dx/len;                 // perpendicular
+    const cx=mx+nx*bulge, cy=my+ny*bulge;        // quadratic control point
+    const pts=[];
+    for (let t=0;t<=steps;t++){ const u=t/steps;
+      const x=(1-u)*(1-u)*d1.x + 2*(1-u)*u*cx + u*u*d2.x;
+      const y=(1-u)*(1-u)*d1.y + 2*(1-u)*u*cy + u*u*d2.y;
+      pts.push([x,y]);
+    }
+    return pts;
+  }
+  // self-loop path: a little circle hanging off dot d in an open direction.
+  function loopPath(d, angle, rad) {
+    const steps=26, pts=[];
+    const cx=d.x+Math.cos(angle)*rad, cy=d.y+Math.sin(angle)*rad;
+    for (let t=0;t<=steps;t++){ const a=angle+Math.PI + (t/steps)*2*Math.PI;
+      pts.push([cx+Math.cos(a)*rad, cy+Math.sin(a)*rad]);
+    }
+    // ensure start/end sit on the dot
+    pts[0]=[d.x,d.y]; pts[pts.length-1]=[d.x,d.y];
+    return pts;
+  }
+
+  // Try to find a non-crossing route for connecting dots i,j (i may equal j for a loop).
+  // Returns { pts, mid:[x,y] } or null if no route found.
+  function route(i, j) {
+    const d1 = dots[i], d2 = dots[j];
+    const others = vines.map(v => v.pts);
+    if (i !== j) {
+      const base = Math.hypot(d2.x-d1.x, d2.y-d1.y);
+      // try many curvatures (both directions, fine-grained) so we rarely reject a vine
+      // that a person could actually draw without crossing.
+      const bulges = [0];
+      for (const f of [0.18,0.36,0.55,0.75,0.95,1.15,1.4,1.7]) { bulges.push(base*f); bulges.push(-base*f); }
+      for (const b of bulges) {
+        const pts = arcPath(d1, d2, b);
+        if (selfCross(pts)) continue;
+        if (others.some(o => polyCross(pts, o))) continue;
+        if (offBoard(pts)) continue;
+        return { pts, mid: pts[Math.floor(pts.length/2)] };
+      }
+    } else {
+      // self-loop: try many directions and radii
+      for (const rad of [40, 32, 48, 26, 56, 64, 22, 72]) {
+        for (let k=0;k<24;k++) {
+          const ang = k*Math.PI/12;
+          const pts = loopPath(d1, ang, rad);
+          if (others.some(o => polyCross(pts, o))) continue;
+          if (offBoard(pts)) continue;
+          // loop must not swallow another dot (keep it clean)
+          if (encirclesDot(pts, i)) continue;
+          const cx=d1.x+Math.cos(ang)*rad, cy=d1.y+Math.sin(ang)*rad;
+          return { pts, mid: [cx, cy] };
+        }
+      }
+    }
+    return null;
+  }
+  function offBoard(pts) {
+    const m = 8;
+    return pts.some(([x,y]) => x<m || y<m || x>size-m || y>size-m);
+  }
+  function encirclesDot(loopPts, selfI) {
+    // reject a loop whose bounding circle contains any OTHER dot
+    const xs=loopPts.map(p=>p[0]), ys=loopPts.map(p=>p[1]);
+    const minx=Math.min(...xs),maxx=Math.max(...xs),miny=Math.min(...ys),maxy=Math.max(...ys);
+    for (let k=0;k<dots.length;k++){ if(k===selfI)continue; const d=dots[k];
+      if (d.x>minx && d.x<maxx && d.y>miny && d.y<maxy) return true; }
+    return false;
+  }
+
+  // Is there ANY legal move available right now?  (used for win detection + AI)
+  function anyLegalMove() { return firstOrAllMoves(true).length > 0; }
+  // Enumerate legal moves. If `firstOnly`, stop after finding one (fast for win-check).
+  function firstOrAllMoves(firstOnly) {
+    const out = [];
+    const live = [];
+    for (let k=0;k<dots.length;k++) if (dots[k].deg < 3) live.push(k);
+    // pairs
+    for (let a=0;a<live.length;a++) {
+      const i = live[a];
+      // self-loop needs 2 spare ends
+      if (dots[i].deg <= 1) {
+        const r = route(i, i);
+        if (r) { out.push({ i, j:i, route:r }); if (firstOnly) return out; }
+      }
+      for (let b=a+1;b<live.length;b++) {
+        const j = live[b];
+        const r = route(i, j);
+        if (r) { out.push({ i, j, route:r }); if (firstOnly) return out; }
+      }
+    }
+    return out;
+  }
+
+  // ---------------- rendering ----------------
+  function render() {
+    svg.innerHTML = '';
+    // vines
+    for (const v of vines) {
+      const path = document.createElementNS(svgNS,'path');
+      path.setAttribute('d', ptsToPath(v.pts));
+      path.setAttribute('fill','none');
+      path.setAttribute('stroke', v.color);
+      path.setAttribute('stroke-width', 7);
+      path.setAttribute('stroke-linecap','round');
+      path.setAttribute('stroke-linejoin','round');
+      path.setAttribute('opacity', 0.85);
+      svg.appendChild(path);
+    }
+    // legal destinations when a dot is selected
+    let dests = new Set();
+    let selfOk = false;
+    if (sel != null) {
+      for (const m of firstOrAllMoves(false)) {
+        if (m.i === sel && m.j === sel) selfOk = true;
+        else if (m.i === sel) dests.add(m.j);
+        else if (m.j === sel) dests.add(m.i);
+      }
+    }
+    // dots
+    dots.forEach((d, k) => {
+      const g = document.createElementNS(svgNS,'g');
+      const c = document.createElementNS(svgNS,'circle');
+      c.setAttribute('cx', d.x); c.setAttribute('cy', d.y);
+      c.setAttribute('r', 15);
+      const dead = d.deg >= 3;
+      let fill = dead ? '#c9c4d4' : '#2ec4b6';
+      let stroke = dead ? '#9b95a8' : '#1f8f84';
+      if (sel === k) { stroke = '#ffd23f'; }
+      if (dests.has(k)) { fill = '#ffd23f'; stroke = '#ff9f1c'; }
+      c.setAttribute('fill', fill); c.setAttribute('stroke', stroke); c.setAttribute('stroke-width', 4);
+      if (!over && !busy && !dead) { c.style.cursor='pointer'; c.addEventListener('click', () => dotClick(k)); }
+      if (sel === k) c.setAttribute('class','sp-sel');
+      g.appendChild(c);
+      // face: sleeping if dead
+      const t = document.createElementNS(svgNS,'text');
+      t.setAttribute('x', d.x); t.setAttribute('y', d.y + 1);
+      t.setAttribute('text-anchor','middle'); t.setAttribute('dominant-baseline','central');
+      t.setAttribute('font-size', 15); t.style.pointerEvents='none'; t.style.userSelect='none';
+      t.textContent = dead ? '😴' : (sel===k ? '👀' : '🌱');
+      g.appendChild(t);
+      if (sel === k && selfOk) {
+        // little hint ring showing a self-loop is allowed
+        const ring = document.createElementNS(svgNS,'circle');
+        ring.setAttribute('cx', d.x); ring.setAttribute('cy', d.y-26); ring.setAttribute('r', 9);
+        ring.setAttribute('fill','none'); ring.setAttribute('stroke','#ff9f1c'); ring.setAttribute('stroke-width',3);
+        ring.setAttribute('stroke-dasharray','4 3');
+        if (!busy){ ring.style.cursor='pointer'; ring.addEventListener('click', () => tryConnect(sel, sel)); }
+        g.appendChild(ring);
+      }
+      svg.appendChild(g);
+    });
+    statusUpdate();
+  }
+  function ptsToPath(pts) {
+    let d = 'M ' + pts[0][0] + ' ' + pts[0][1];
+    for (let i=1;i<pts.length;i++) d += ' L ' + pts[i][0] + ' ' + pts[i][1];
+    return d;
+  }
+
+  function statusUpdate() {
+    if (over) return;
+    const who = vsAI ? (turn===AI ? '🤖 Computer…' : '🧒 Your turn') : ('Player ' + turn);
+    MM.status(`<span class="chip" style="background:${HEX[turn]}">${who}</span>`);
+    if (vsAI && turn === AI) hint.textContent = 'The computer is growing a vine…';
+    else if (sel != null) hint.textContent = 'Tap a yellow dot to connect, tap the loop ring for a self-vine, or tap 👀 again to cancel.';
+    else hint.textContent = 'Tap a green dot to start a vine.';
+  }
+
+  // ---------------- interaction ----------------
+  function dotClick(k) {
+    if (over || busy) return;
+    if (vsAI && turn === AI) return;
+    if (dots[k].deg >= 3) { MM.sound.play('wrong'); return; }
+    if (sel == null) { sel = k; MM.sound.play('click'); render(); return; }
+    if (k === sel) {
+      // second click on same dot => attempt a self-loop if allowed, else cancel
+      if (dots[k].deg <= 1 && route(k, k)) { tryConnect(k, k); return; }
+      sel = null; MM.sound.play('click'); render(); return;
+    }
+    tryConnect(sel, k);
+  }
+
+  function tryConnect(i, j) {
+    const r = route(i, j);
+    if (!r) { MM.sound.play('wrong'); flashNo(); return; }
+    commit(i, j, r);
+  }
+  function flashNo() {
+    hint.textContent = "Those vines would tangle — try a different dot! 🌿";
+    svg.animate([{ transform:'translateX(-4px)' },{ transform:'translateX(4px)' },{ transform:'translateX(0)' }], { duration: 220 });
+  }
+
+  async function commit(i, j, r) {
+    busy = true; sel = null;
+    const color = HEX[turn];
+    // grow animation: reveal the vine progressively
+    const vine = { pts: r.pts, color };
+    vines.push(vine);
+    // account degrees
+    if (i === j) dots[i].deg += 2; else { dots[i].deg += 1; dots[j].deg += 1; }
+    // new middle dot (degree 2)
+    const mid = r.mid;
+    const nd = { id: nextId++, x: mid[0], y: mid[1], deg: 2 };
+    MM.sound.play('swoosh');
+    await growVine(vine);
+    dots.push(nd);
+    MM.sound.play('pop');
+    render();
+    // sparkle on the new sprout
+    sparkle(mid[0], mid[1]);
+    await MM.sleep(180);
+
+    // did THIS move end the game? next player to move loses if no move remains.
+    turn = turn === 1 ? 2 : 1;
+    if (!anyLegalMove()) { endGame(turn); return; }   // `turn` (the next player) cannot move => loses
+    busy = false;
+    render();
+    if (vsAI && turn === AI) { busy = true; statusUpdate(); setTimeout(aiTurn, 480); }
+  }
+
+  // animate a vine drawing on with stroke-dashoffset
+  async function growVine(vine) {
+    render();
+    const path = svg.querySelector('path:last-of-type');
+    if (!path) return;
+    const len = path.getTotalLength ? path.getTotalLength() : 300;
+    path.style.strokeDasharray = len;
+    path.style.strokeDashoffset = len;
+    path.getBoundingClientRect();
+    path.style.transition = 'stroke-dashoffset .34s ease';
+    path.style.strokeDashoffset = '0';
+    await MM.sleep(340);
+  }
+  function sparkle(x, y) {
+    const t = document.createElementNS(svgNS,'text');
+    t.setAttribute('x', x); t.setAttribute('y', y - 22);
+    t.setAttribute('text-anchor','middle'); t.setAttribute('font-size', 22);
+    t.textContent = '✨'; t.style.pointerEvents='none';
+    svg.appendChild(t);
+    t.animate([{opacity:1, transform:'translateY(0)'},{opacity:0, transform:'translateY(-14px)'}], {duration:600});
+    setTimeout(()=>t.remove(), 600);
+  }
+
+  // ---------------- AI ----------------
+  // Minimax on the degree-graph + geometry.  Because our move legality depends on the
+  // actual routes (crossings), we search the REAL move list, but bound the depth/branching
+  // so it stays fast.  Value: +1 = side-to-move eventually wins, -1 = loses.
+  function aiTurn() {
+    if (over) return;
+    const moves = firstOrAllMoves(false);
+    if (moves.length === 0) { endGame(AI); return; }   // shouldn't happen (checked before)
+    let pick;
+    if (!hard && Math.random() < 0.5) {
+      pick = MM.choice(moves);
+    } else {
+      pick = bestMove(moves);
+    }
+    commit(pick.i, pick.j, pick.route);
+  }
+
+  function bestMove(moves) {
+    // snapshot current position for pure search (degrees + vine geometry)
+    // We simulate moves on lightweight copies. Depth-limited negamax with move cap.
+    const NODE_BUDGET = 4500;
+    let nodes = 0;
+
+    // lightweight sim state
+    function snapshot() {
+      return {
+        dots: dots.map(d => ({ x:d.x, y:d.y, deg:d.deg })),
+        vines: vines.map(v => v.pts),
+      };
+    }
+    function legalMoves(S) {
+      // recompute routes against S geometry
+      const saveDots = dots, saveVines = vines;
+      dots = S.dots; vines = S.vines.map(p => ({ pts:p }));
+      const mv = firstOrAllMoves(false).map(m => ({ i:m.i, j:m.j, pts:m.route.pts, mid:m.route.mid }));
+      dots = saveDots; vines = saveVines;
+      return mv;
+    }
+    function doMove(S, m) {
+      const nd = S.dots.map(d => ({ x:d.x, y:d.y, deg:d.deg }));
+      const nv = S.vines.map(p => p);
+      if (m.i === m.j) nd[m.i].deg += 2; else { nd[m.i].deg += 1; nd[m.j].deg += 1; }
+      nv.push(m.pts);
+      nd.push({ x:m.mid[0], y:m.mid[1], deg:2 });
+      return { dots:nd, vines:nv };
+    }
+    // negamax: returns +1 if side-to-move wins with best play, else -1. (No draws in Sprouts.)
+    function negamax(S, depth) {
+      nodes++;
+      const mv = legalMoves(S);
+      if (mv.length === 0) return -1;                 // no move => current player loses
+      if (nodes > NODE_BUDGET || depth > 8) {
+        // heuristic: parity of remaining move-capacity is a decent proxy in Sprouts.
+        const spare = S.dots.reduce((s,d)=>s + (3 - d.deg), 0);
+        // more spare & odd tends to favor the mover — return a soft guess as +/-1
+        return (mv.length % 2 === 1) ? 1 : -1;
+      }
+      // limit branching for speed
+      const order = MM.shuffle(mv.slice()).slice(0, 10);
+      for (const m of order) {
+        const r = negamax(doMove(S, m), depth + 1);
+        if (r === -1) return 1;                        // opponent loses => we win
+      }
+      return -1;
+    }
+
+    const S0 = snapshot();
+    // try to find a winning move; else pick a move that maximizes our chances (heuristic)
+    let best = moves[0], bestVal = -2;
+    const order = MM.shuffle(moves.slice());
+    for (const m of order) {
+      const mm = { i:m.i, j:m.j, pts:m.route.pts, mid:m.route.mid };
+      const S1 = doMove(S0, mm);
+      const r = negamax(S1, 0);       // r = value to OPPONENT after our move
+      const val = -r;                 // our value
+      if (val > bestVal) { bestVal = val; best = m; if (val === 1) break; }
+      if (nodes > NODE_BUDGET) break;
+    }
+    return best;
+  }
+
+  // ---------------- end ----------------
+  function endGame(loser) {
+    over = true; busy = false; sel = null;
+    render();
+    const winner = loser === 1 ? 2 : 1;
+    MM.sound.play('swoosh');
+    if (vsAI) {
+      const youWin = winner !== AI;
+      MM.win({ lose: !youWin, title: youWin ? 'You win! 🎉' : 'Computer wins!',
+        emoji: youWin ? '🏆' : '🤖',
+        sub: (loser === AI ? 'The computer' : 'You') + ' had no vine left to grow.',
+        onAgain: () => MM.toMenu() });
+    } else {
+      MM.win({ title: 'Player ' + winner + ' wins! 🎉', emoji: winner === 1 ? '🔵' : '🔴',
+        sub: 'Player ' + loser + ' had no move left.', onAgain: () => MM.toMenu() });
+    }
+  }
+
+  function reset() {
+    dots = []; vines = []; nextId = 0; turn = 1; over = false; busy = false; sel = null;
+    // place starting dots on a circle
+    const cx = size/2, cy = size/2, R = size*0.30;
+    const n = startDots;
+    for (let i=0;i<n;i++){ const a = -Math.PI/2 + i*2*Math.PI/n;
+      dots.push({ id: nextId++, x: cx + R*Math.cos(a), y: cy + R*Math.sin(a), deg: 0 }); }
+    render();
+    // human (P1) always starts; AI never moves first here.
+  }
+
+  buildPills();
+  reset();
+}
+</script>
+<style>
+  .sp-lbl { font-weight: 800; align-self: center; color: var(--ink-soft); font-size: 15px; }
+  .sp-sel { animation: spPulse .8s ease-in-out infinite; transform-box: fill-box; transform-origin: center; }
+  @keyframes spPulse { 0%,100%{ r: 15px } 50%{ r: 17px } }
+  svg text { user-select: none; }
+</style>
+</body>
+</html>

@@ -1,0 +1,489 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Hungry Monster</title>
+<link rel="stylesheet" href="../../assets/common.css">
+<style>
+  /* Monster + chomp animation (CSS/emoji art only) */
+  .hm-monster {
+    font-size: 92px; line-height: 1; display: inline-block;
+    filter: drop-shadow(0 8px 0 rgba(0,0,0,.12));
+    transition: transform .12s ease;
+  }
+  .hm-monster.chomp { animation: hm-chomp .5s ease; }
+  @keyframes hm-chomp {
+    0%   { transform: scale(1) rotate(0); }
+    25%  { transform: scale(1.25) rotate(-6deg); }
+    50%  { transform: scale(.9) rotate(5deg); }
+    75%  { transform: scale(1.18) rotate(-3deg); }
+    100% { transform: scale(1) rotate(0); }
+  }
+  .hm-monster.confused { animation: hm-wob 1s ease; }
+  @keyframes hm-wob { 0%,100%{transform:rotate(-8deg)} 50%{transform:rotate(8deg)} }
+  /* a card flying up into the monster's mouth */
+  .hm-fly {
+    position: fixed; z-index: 55; transition: transform .45s cubic-bezier(.5,-0.2,.6,1), opacity .45s ease;
+    pointer-events: none;
+  }
+  .hm-plate {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 56px; height: 78px; border-radius: 12px; border: 3px dashed #c9c1d8;
+    color: #b9b1c8; font-size: 26px;
+  }
+</style>
+</head>
+<body>
+<script src="../../assets/common.js"></script>
+<script>
+/* HUNGRY MONSTER — a cute monster eats the BIGGER card each round.
+   Deck of number cards (1..10, four each), split evenly & face-down.
+   Each round both play a card; higher card is fed to the monster (removed);
+   lower card's owner keeps it. Tie = confused monster, each takes their own
+   card back. When cards run out, MOST cards kept wins.
+
+   FLIP (pure luck): auto-flip the top card each round.
+   CHOOSE WISELY (featured): each player holds 3 cards and secretly chooses
+   which to play, then draws back to 3 — this adds real decisions + AI. */
+
+const HEX = { 1: '#3a86ff', 2: '#ff5a5f' };
+const MONSTERS = ['👹', '👾', '🐲', '👺'];
+
+MM.game({
+  title: 'Hungry Monster', emoji: '👹',
+  ba: 'https://beastacademy.com/playground/hungry-monster',
+  rules: `
+    <p><b>Feed the hungry monster the BIGGER card!</b> 👹</p>
+    <ol>
+      <li>The number cards are split evenly between both players.</li>
+      <li>Each round, both play a card. The <b>bigger</b> card gets <b>gobbled by the monster</b> 😋</li>
+      <li>The player with the <b>smaller</b> card gets to <b>keep it</b>!</li>
+      <li>Same number? The monster gets <b>confused</b> 😵 and you each take your card back.</li>
+      <li>When the cards run out, whoever <b>kept the most cards wins</b> 🏆</li>
+    </ol>
+    <p><b>Flip</b> = pure luck (great for little ones). <b>Choose Wisely</b> = you pick which card to
+    play from a hand of 3 — sneaky strategy!</p>`,
+  modes: [
+    { id: 'two', emoji: '🧑‍🤝‍🧑', name: '2 Players', sub: 'Pass & play' },
+    { id: 'ai',  emoji: '🤖', name: 'Vs Computer', sub: 'You vs the robot' },
+  ],
+  onStart,
+});
+
+function onStart(mode, mount) {
+  const vsAI = (mode === 'ai');
+  let variant = 'flip';                 // 'flip' | 'choose'
+  const MONSTER = MM.choice(MONSTERS);
+
+  // state (rebuilt on each game start)
+  let piles = { 1: [], 2: [] };         // face-down draw piles
+  let hands = { 1: [], 2: [] };         // (choose mode) 3-card hands
+  let kept = { 1: 0, 2: 0 };            // cards kept (score)
+  let round = 0;
+  let busy = false;
+  let sel = { 1: null, 2: null };       // chosen card index (choose mode)
+
+  const panel = MM.el('div', { class: 'mm-panel mm-center mm-bounce-in' });
+  mount.appendChild(panel);
+
+  function label(pl) { return vsAI ? (pl === 1 ? 'You' : 'Computer') : 'Player ' + pl; }
+  function other(pl) { return pl === 1 ? 2 : 1; }
+
+  // ---- deck ----
+  function newDeck() {
+    const d = [];
+    for (let v = 1; v <= 10; v++) for (let k = 0; k < 4; k++) d.push(v);
+    return MM.shuffle(d);
+  }
+
+  // ---- variant switcher pill ----
+  function variantPills() {
+    const wrap = MM.el('div', { class: 'mm-pills', style: { marginBottom: '10px' } });
+    [['flip', '🎲 Flip', 'pure luck'], ['choose', '🧠 Choose Wisely', 'strategy']].forEach(([id, name]) => {
+      const p = MM.el('button', {
+        class: 'mm-pill', 'aria-pressed': variant === id ? 'true' : 'false',
+        onClick: () => { if (busy || variant === id) return; MM.sound.play('pop'); variant = id; startGame(); },
+      }, name);
+      wrap.appendChild(p);
+    });
+    return wrap;
+  }
+
+  function scorebar() {
+    return MM.el('div', { class: 'mm-scorebar' },
+      MM.el('div', { class: 'mm-score' },
+        MM.el('span', { class: 'dot', style: { background: HEX[1] } }),
+        MM.el('span', {}, label(1) + ' kept: ' + kept[1])),
+      MM.el('div', { class: 'mm-score' },
+        MM.el('span', {}, '🎴 Left: ' + (piles[1].length + piles[2].length + hands[1].length + hands[2].length))),
+      MM.el('div', { class: 'mm-score' },
+        MM.el('span', { class: 'dot', style: { background: HEX[2] } }),
+        MM.el('span', {}, label(2) + ' kept: ' + kept[2])));
+  }
+
+  // ---- card element ----
+  function cardEl(v, opts) {
+    opts = opts || {};
+    const c = MM.card(opts.back ? '' : v, { back: !!opts.back, color: opts.color });
+    if (opts.small) { c.style.width = '52px'; c.style.height = '74px'; c.style.fontSize = '26px'; }
+    if (opts.sel) c.classList.add('sel');
+    if (opts.on) { c.style.cursor = 'pointer'; c.addEventListener('click', opts.on); }
+    return c;
+  }
+
+  let monsterEl;   // reference so we can trigger chomp
+
+  // ================= layout =================
+  function layout(centerNode, bottomNode, msg) {
+    panel.innerHTML = '';
+    panel.appendChild(variantPills());
+    panel.appendChild(scorebar());
+
+    // Player 2 (top) pile info
+    panel.appendChild(MM.el('div', { style: { fontWeight: '800', color: HEX[2], marginTop: '4px' } },
+      label(2) + (variant === 'choose' ? '' : (' — ' + piles[2].length + ' cards left'))));
+
+    // top hand / facedown row
+    panel.appendChild(topRow());
+
+    // monster
+    monsterEl = MM.el('div', { class: 'hm-monster' }, MONSTER);
+    panel.appendChild(MM.el('div', { style: { margin: '6px 0' } }, monsterEl));
+
+    // center play area (the two played cards)
+    panel.appendChild(centerNode || MM.el('div', { style: { minHeight: '84px' } }));
+
+    // bottom (player 1 hand or flip button)
+    panel.appendChild(MM.el('div', { style: { fontWeight: '800', color: HEX[1], marginTop: '6px' } },
+      label(1) + (variant === 'choose' ? '' : (' — ' + piles[1].length + ' cards left'))));
+    panel.appendChild(bottomNode || MM.el('div'));
+
+    if (msg) panel.appendChild(MM.el('div', { class: 'mm-hint', style: { fontSize: '16px', marginTop: '8px' }, html: msg }));
+  }
+
+  function topRow() {
+    if (variant === 'choose' && (!vsAI)) {
+      // in 2-player choose we hide via cover screens, so top is always face-down count
+      const row = MM.el('div', { style: { display: 'flex', gap: '5px', justifyContent: 'center' } });
+      for (let i = 0; i < hands[2].length; i++) row.appendChild(cardEl(0, { back: true, small: true }));
+      return row;
+    }
+    if (variant === 'choose' && vsAI) {
+      const row = MM.el('div', { style: { display: 'flex', gap: '5px', justifyContent: 'center' } });
+      for (let i = 0; i < hands[2].length; i++) row.appendChild(cardEl(0, { back: true, small: true }));
+      return row;
+    }
+    // flip: just the facedown pile
+    return MM.el('div', { style: { display: 'flex', justifyContent: 'center' } },
+      piles[2].length ? cardEl(0, { back: true, small: true }) : MM.el('div', { class: 'hm-plate' }, '∅'));
+  }
+
+  // ================= FLIP variant =================
+  function flipView(msg) {
+    const center = MM.el('div', {
+      id: 'hm-center',
+      style: { display: 'flex', gap: '30px', justifyContent: 'center', alignItems: 'center', minHeight: '84px' },
+    },
+      MM.el('div', { class: 'hm-plate' }, '?'),
+      MM.el('div', { class: 'hm-plate' }, '?'));
+    const btn = MM.el('button', {
+      class: 'mm-btn green', style: { fontSize: '20px', padding: '14px 30px', minHeight: '54px', marginTop: '10px' },
+      onClick: flipRound,
+    }, '🎲 Flip!');
+    if (busy) btn.disabled = true;
+    layout(center, MM.el('div', { class: 'mm-row' }, btn), msg);
+  }
+
+  async function flipRound() {
+    if (busy) return;
+    if (piles[1].length === 0 || piles[2].length === 0) { endGame(); return; }
+    busy = true;
+    round++;
+    const c1 = piles[1].pop(), c2 = piles[2].pop();
+    MM.sound.play('deal');
+    // rebuild the board (button now disabled while busy), then reveal both cards
+    flipView();
+    revealInto(c1, c2);
+    await resolveRound(c1, c2);
+    busy = false;
+    if (piles[1].length === 0 || piles[2].length === 0) { endGame(); return; }
+    flipView('Tap <b>Flip!</b> for the next round.');
+  }
+
+  function labelled(pl, cardNode) {
+    return MM.el('div', { style: { display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '4px' } },
+      MM.el('div', { style: { fontWeight: '800', color: HEX[pl], fontSize: '14px' } }, label(pl)),
+      cardNode);
+  }
+
+  // put the two revealed cards into the (freshly rebuilt) center
+  function revealInto(c1, c2) {
+    const center = document.getElementById('hm-center');
+    if (!center) return;
+    center.innerHTML = '';
+    center.appendChild(labelled(1, cardEl(c1, { color: HEX[1] })));
+    center.appendChild(labelled(2, cardEl(c2, { color: HEX[2] })));
+  }
+
+  // ================= CHOOSE variant =================
+  function chooseView(msg) {
+    // center shows placeholders until reveal
+    const center = MM.el('div', {
+      id: 'hm-center',
+      style: { display: 'flex', gap: '30px', justifyContent: 'center', alignItems: 'center', minHeight: '84px' },
+    },
+      MM.el('div', { class: 'hm-plate' }, sel[2] != null ? '🔒' : '?'),
+      MM.el('div', { class: 'hm-plate' }, sel[1] != null ? '🔒' : '?'));
+
+    // bottom = player 1's hand of 3, clickable
+    const handRow = MM.el('div', { style: { display: 'flex', gap: '8px', justifyContent: 'center', marginTop: '4px' } });
+    hands[1].forEach((v, i) => {
+      handRow.appendChild(cardEl(v, {
+        color: HEX[1], small: true, sel: sel[1] === i,
+        on: (!busy) ? () => humanChoose(i) : null,
+      }));
+    });
+    layout(center, handRow, msg);
+  }
+
+  function humanChoose(i) {
+    if (busy) return;
+    MM.sound.play('click');
+    sel[1] = i;
+    chooseView('You chose a <b>' + hands[1][i] + '</b>. Tap <b>Play!</b> to reveal.');
+    // add a play button under the hand
+    const playBtn = MM.el('button', {
+      class: 'mm-btn green', style: { fontSize: '20px', padding: '13px 28px', minHeight: '54px', marginTop: '10px' },
+      onClick: chooseReveal,
+    }, '▶️ Play!');
+    panel.appendChild(MM.el('div', { class: 'mm-row' }, playBtn));
+  }
+
+  // 2-player: cover screen so P2 picks secretly
+  function coverScreen(who) {
+    return new Promise(resolve => {
+      panel.innerHTML = '';
+      panel.appendChild(variantPills());
+      panel.appendChild(scorebar());
+      panel.appendChild(MM.el('div', { class: 'mm-center', style: { padding: '20px 6px' } },
+        MM.el('div', { style: { fontSize: '60px' } }, '🙈'),
+        MM.el('h2', {}, 'Pass to ' + label(who)),
+        MM.el('div', { class: 'mm-hint' }, 'No peeking, ' + label(other(who)) + '! 👀'),
+        MM.el('button', {
+          class: 'mm-btn', style: { fontSize: '20px', padding: '14px 30px', minHeight: '54px', background: HEX[who] },
+          onClick: () => { MM.sound.play('swoosh'); resolve(); },
+        }, '👉 I’m ' + label(who) + ' — ready!')));
+    });
+  }
+
+  function chooseHandView(who, prompt, onPick) {
+    // shows `who`'s hand for secret selection (2-player)
+    panel.innerHTML = '';
+    panel.appendChild(variantPills());
+    panel.appendChild(scorebar());
+    panel.appendChild(MM.el('div', { style: { fontWeight: '800', color: HEX[who], margin: '8px 0' } }, prompt));
+    const row = MM.el('div', { style: { display: 'flex', gap: '10px', justifyContent: 'center' } });
+    hands[who].forEach((v, i) => {
+      row.appendChild(cardEl(v, { color: HEX[who], on: () => onPick(i) }));
+    });
+    panel.appendChild(row);
+    panel.appendChild(MM.el('div', { class: 'mm-hint' }, 'Tap the card you want to play.'));
+  }
+
+  async function chooseReveal() {
+    if (busy) return;
+    busy = true;
+    if (vsAI) {
+      sel[2] = aiChoose();
+    }
+    const c1 = hands[1][sel[1]], c2 = hands[2][sel[2]];
+    // remove chosen cards from hands
+    hands[1].splice(sel[1], 1);
+    hands[2].splice(sel[2], 1);
+    round++;
+    MM.sound.play('deal');
+    chooseView();
+    revealInto(c1, c2);
+    await resolveRound(c1, c2);
+    // draw back up to 3
+    drawUp(1); drawUp(2);
+    sel = { 1: null, 2: null };
+    busy = false;
+    if (roundsLeft() === false) { endGame(); return; }
+    // next round
+    if (vsAI) {
+      chooseView('Your turn — tap a card to choose.');
+    } else {
+      await twoPlayerChooseFlow();
+    }
+  }
+
+  function roundsLeft() {
+    // choose mode: game continues while either hand still has cards
+    return (hands[1].length > 0 && hands[2].length > 0);
+  }
+
+  function drawUp(pl) {
+    while (hands[pl].length < 3 && piles[pl].length > 0) hands[pl].push(piles[pl].pop());
+  }
+
+  // simple AI heuristic for choose mode:
+  //  - If we hold a card that BARELY beats a likely opponent low card, avoid it.
+  //  - Strategy: monster eats the higher card and you LOSE it; you keep the lower.
+  //    So you WANT to play LOW (to keep a card) — but if you play too low you may
+  //    lose the round only in ties. Actually: lower card's owner keeps their card,
+  //    higher is removed. So playing your LOWEST card is safest to keep a card,
+  //    but you want to *win rounds* = keep cards. You keep a card whenever you are
+  //    NOT the higher card. To maximize kept cards over the game, dump high cards
+  //    when the opponent is likely high, and keep lows for when opponent is low.
+  //  Heuristic: play the card most likely to be the LOWER of the two (so you keep
+  //  it), unless we're near end-game and should offload a high card.
+  function aiChoose() {
+    const me = hands[2];
+    // estimate opponent's typical card: average of remaining deck values ~ mid.
+    // Play our lowest card most of the time to keep it, but occasionally dump a
+    // high card so we don't get stuck holding all highs at the end.
+    let lowIdx = 0;
+    for (let i = 1; i < me.length; i++) if (me[i] < me[lowIdx]) lowIdx = i;
+    let highIdx = 0;
+    for (let i = 1; i < me.length; i++) if (me[i] > me[highIdx]) highIdx = i;
+    // If we're holding a very high card (>=9) and pile is getting low, dump it.
+    const totalLeft = piles[2].length + me.length;
+    if (me[highIdx] >= 9 && MM.rand(2) === 0) return highIdx;
+    if (totalLeft <= 4 && me[highIdx] >= 8) return highIdx;
+    // Otherwise keep our lowest (playing low means we likely keep it).
+    // But add a little randomness so it's beatable / not perfectly predictable.
+    if (MM.rand(4) === 0) return MM.rand(me.length);
+    return lowIdx;
+  }
+
+  async function twoPlayerChooseFlow() {
+    // Player 1 picks behind cover, then Player 2, then reveal.
+    await coverScreen(1);
+    await new Promise(res => {
+      chooseHandView(1, label(1) + ' — choose a card', (i) => { sel[1] = i; MM.sound.play('click'); res(); });
+    });
+    await coverScreen(2);
+    await new Promise(res => {
+      chooseHandView(2, label(2) + ' — choose a card', (i) => { sel[2] = i; MM.sound.play('click'); res(); });
+    });
+    // reveal both
+    busy = true;
+    const c1 = hands[1][sel[1]], c2 = hands[2][sel[2]];
+    hands[1].splice(sel[1], 1);
+    hands[2].splice(sel[2], 1);
+    round++;
+    MM.sound.play('deal');
+    chooseView();
+    revealInto(c1, c2);
+    await resolveRound(c1, c2);
+    drawUp(1); drawUp(2);
+    sel = { 1: null, 2: null };
+    busy = false;
+    if (roundsLeft() === false) { endGame(); return; }
+    await twoPlayerChooseFlow();
+  }
+
+  // ================= shared round resolution =================
+  async function chomp() {
+    monsterEl.classList.add('chomp');
+    MM.sound.play('pop'); MM.sound.play('wrong');
+    await MM.sleep(500);
+    monsterEl.classList.remove('chomp');
+  }
+
+  async function resolveRound(c1, c2) {
+    await MM.sleep(650);
+    let msg, winner = 0;
+    if (c1 === c2) {
+      // tie — confused monster, each takes own card back (kept +1 each? No: they
+      // take their own card back to their pile — it counts as kept for scoring
+      // purposes per rules "each takes their own card back". We count both kept.)
+      monsterEl.classList.add('confused');
+      MM.sound.play('roll');
+      await MM.sleep(700);
+      monsterEl.classList.remove('confused');
+      kept[1]++; kept[2]++;
+      msg = '😵 <b>Confused monster!</b> It’s a tie — you each keep your card.';
+    } else {
+      const bigPl = c1 > c2 ? 1 : 2;
+      const smallPl = other(bigPl);
+      // monster eats the bigger; smaller owner keeps theirs
+      await chomp();
+      kept[smallPl]++;
+      msg = '😋 The monster gobbled the <b>' + Math.max(c1, c2) + '</b>! ' +
+        label(smallPl) + ' keeps the <b>' + Math.min(c1, c2) + '</b>. ';
+      winner = smallPl;
+    }
+    // update scorebar in place
+    const sb = panel.querySelector('.mm-scorebar');
+    if (sb) sb.replaceWith(scorebar());
+    // show verdict message
+    const hint = panel.querySelector('.mm-hint');
+    if (hint) hint.innerHTML = msg; else panel.appendChild(MM.el('div', { class: 'mm-hint', style: { fontSize: '16px' }, html: msg }));
+    if (winner) MM.sound.play('ding');
+    await MM.sleep(900);
+  }
+
+  // ================= end =================
+  function endGame() {
+    busy = true;
+    const s1 = kept[1], s2 = kept[2];
+    const winner = s1 > s2 ? 1 : s2 > s1 ? 2 : 0;
+    setTimeout(() => {
+      if (winner === 0) {
+        MM.win({ title: "It’s a tie! 🤝", emoji: '👹', sub: 'You each kept ' + s1 + ' cards!', onAgain: () => MM.toMenu() });
+      } else if (vsAI) {
+        const youWin = winner === 1;
+        MM.win({ lose: !youWin, title: youWin ? 'You win! 🎉' : 'Computer wins!',
+          emoji: youWin ? '🏆' : '🤖',
+          sub: 'You kept ' + s1 + ', computer kept ' + s2 + '.', onAgain: () => MM.toMenu() });
+      } else {
+        MM.win({ title: label(winner) + ' wins! 🎉', emoji: winner === 1 ? '🔵' : '🔴',
+          sub: label(1) + ' kept ' + s1 + ', ' + label(2) + ' kept ' + s2 + '.', onAgain: () => MM.toMenu() });
+      }
+    }, 700);
+  }
+
+  // ================= start / deal =================
+  async function startGame() {
+    busy = true;
+    kept = { 1: 0, 2: 0 };
+    round = 0;
+    sel = { 1: null, 2: null };
+    const deck = newDeck();
+    // split evenly
+    piles = { 1: [], 2: [] };
+    hands = { 1: [], 2: [] };
+    deck.forEach((v, i) => piles[i % 2 === 0 ? 1 : 2].push(v));
+
+    MM.status('<span class="chip" style="background:#ff9f1c">' +
+      (variant === 'flip' ? 'Flip mode 🎲' : 'Choose Wisely 🧠') + '</span>');
+
+    if (variant === 'choose') {
+      // deal 3-card hands from each player's own pile
+      drawUp(1); drawUp(2);
+    }
+
+    // quick deal animation
+    layout(null, null, 'Splitting the deck… 🎴');
+    for (let i = 0; i < 4; i++) { MM.sound.play('deal'); await MM.sleep(130); layout(null, null, 'Splitting the deck… 🎴'); }
+    busy = false;
+
+    if (variant === 'flip') {
+      flipView('Tap <b>Flip!</b> to feed the monster.');
+    } else {
+      if (vsAI) {
+        chooseView('Pick a card to play — keep low cards to win them back!');
+      } else {
+        await twoPlayerChooseFlow();
+      }
+    }
+  }
+
+  startGame();
+}
+</script>
+</body>
+</html>

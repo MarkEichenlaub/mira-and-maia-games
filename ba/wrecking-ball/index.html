@@ -1,0 +1,542 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Wrecking Ball</title>
+<link rel="stylesheet" href="../../assets/common.css">
+</head>
+<body>
+<script src="../../assets/common.js"></script>
+<script>
+/* WRECKING BALL — a pendulum knocks down blocks labeled 1, 3, and 9.
+   You get up to 3 swings per turn (each swing knocks down at most one block).
+   Then combine the knocked-down numbers with + or − to make a number and cross
+   it off your 1–13 card. First to cross off all of 1–13 wins.
+
+   Math: 1, 3, 9 are powers of three, so with + and − every number 1–13 is
+   reachable (balanced ternary). e.g. 2 = 3 − 1, 5 = 9 − 3 − 1, 13 = 9 + 3 + 1.
+
+   Skill: time the "Swing!"/"Smash!" taps so the ball is over the block you
+   want when you smash. Timing is forgiving (a wide hit window). */
+
+const HEX = { 1: '#3a86ff', 2: '#ff5a5f' };
+const BLOCKS = [1, 3, 9];
+const TARGET = 13;
+
+MM.game({
+  title: 'Wrecking Ball', emoji: '🏗️',
+  ba: 'https://beastacademy.com/playground/wrecking-ball',
+  rules: `
+    <p><b>Knock down blocks and do the math!</b> A wrecking ball 🔨 swings over three blocks: <b>1</b>, <b>3</b>, and <b>9</b>.</p>
+    <ol>
+      <li>Tap <b>Swing!</b> to start the ball swinging.</li>
+      <li>Tap <b>Smash!</b> when the ball is right over the block you want. 🎯</li>
+      <li>You get up to <b>3 swings</b> — each can knock down one block.</li>
+      <li>Then join your numbers with <b>+</b> or <b>−</b> to make a total, and cross it off your <b>1–13</b> card.</li>
+    </ol>
+    <p>First to cross off <b>every</b> number from 1 to 13 wins! 🏆</p>
+    <p>Cool trick: with 1, 3 and 9 you can make any number 1–13. Try 2 = 3 − 1, or 5 = 9 − 3 − 1!</p>`,
+  modes: [
+    { id: 'solo', emoji: '⭐', name: 'Solo',        sub: 'Clear your card — beat your best!' },
+    { id: 'ai',   emoji: '🤖', name: 'Vs Computer', sub: 'You vs the robot' },
+    { id: 'two',  emoji: '🧑‍🤝‍🧑', name: '2 Players',  sub: 'Pass & play race' },
+  ],
+  onStart,
+});
+
+function onStart(mode, mount) {
+  const vsAI = (mode === 'ai');
+  const solo = (mode === 'solo');
+  const twoP = (mode === 'two');
+
+  function label(pl) { return solo ? 'You' : vsAI ? (pl === 1 ? 'You' : 'Computer') : ('Player ' + pl); }
+
+  // per-player 1..13 card (index 1..13 => crossed?)
+  function newCard() { const a = {}; for (let n = 1; n <= TARGET; n++) a[n] = false; return a; }
+  const P = { 1: { card: newCard() }, 2: { card: newCard() } };
+  let turn = 1;
+  let over = false;
+  let turnsTaken = 0;          // solo: count of completed turns
+  const best = MM.load('wreck-best', null);
+
+  const panel = MM.el('div', { class: 'mm-panel mm-center mm-bounce-in' });
+  mount.appendChild(panel);
+
+  const remaining = (pl) => { let n = 0; for (let k = 1; k <= TARGET; k++) if (!P[pl].card[k]) n++; return n; };
+  const cardDone = (pl) => remaining(pl) === 0;
+
+  /* ---------- geometry for the pendulum stage ---------- */
+  function dims() {
+    const w = Math.max(300, Math.min(560, window.innerWidth - 40));
+    return { w, h: Math.round(w * 0.72) };
+  }
+
+  // ---------- the 1–13 card widget ----------
+  function cardEl(pl, opts) {
+    opts = opts || {};
+    const grid = MM.el('div', {
+      style: {
+        display: 'grid', gridTemplateColumns: 'repeat(7, 1fr)', gap: '6px',
+        maxWidth: '360px', margin: '0 auto',
+      },
+    });
+    for (let n = 1; n <= TARGET; n++) {
+      const done = P[pl].card[n];
+      const canMark = opts.markable && opts.markable.has(n) && !done;
+      const cell = MM.el('div', {
+        style: {
+          position: 'relative', height: '42px', borderRadius: '12px',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          fontWeight: '800', fontSize: '20px',
+          background: done ? '#e9e3f2' : (canMark ? '#fff6c9' : '#fff'),
+          color: done ? '#b9b0cf' : HEX[pl],
+          boxShadow: canMark ? '0 4px 0 #ffd23f' : 'inset 0 0 0 2px #efe9f7',
+          cursor: canMark ? 'pointer' : 'default',
+          transition: 'transform .1s ease',
+        },
+      }, String(n));
+      if (done) {
+        cell.appendChild(MM.el('div', {
+          style: {
+            position: 'absolute', left: '6px', right: '6px', top: '50%', height: '4px',
+            background: HEX[pl], borderRadius: '3px', transform: 'rotate(-12deg)', opacity: '.85',
+          },
+        }));
+      }
+      if (canMark && opts.onMark) cell.addEventListener('click', () => opts.onMark(n));
+      grid.appendChild(cell);
+    }
+    return grid;
+  }
+
+  function scorebar() {
+    if (solo) {
+      return MM.el('div', { class: 'mm-scorebar' },
+        MM.el('div', { class: 'mm-score' }, MM.el('span', { class: 'dot', style: { background: HEX[1] } }),
+          MM.el('span', {}, 'Turns: ' + turnsTaken)),
+        MM.el('div', { class: 'mm-score' }, '🎯 Left: ' + remaining(1)),
+        best != null ? MM.el('div', { class: 'mm-score' }, '⭐ Best: ' + best) : null,
+      );
+    }
+    return MM.el('div', { class: 'mm-scorebar' },
+      [1, 2].map(pl => MM.el('div', { class: 'mm-score' + (pl === turn && !over ? ' active' : '') },
+        MM.el('span', { class: 'dot', style: { background: HEX[pl] } }),
+        MM.el('span', {}, label(pl) + ': ' + remaining(pl) + ' left'))));
+  }
+
+  /* =========================================================================
+     A TURN: up to 3 swings, then combine.
+     ========================================================================= */
+  function beginTurn() {
+    if (over) return;
+    if (vsAI && turn === 2) { aiTurn(); return; }
+    swingPhase([]);
+  }
+
+  /* ---------- SWING PHASE (skill / timing) ---------- */
+  // knocked: array of block values knocked so far this turn.
+  function swingPhase(knocked) {
+    panel.innerHTML = '';
+    panel.appendChild(scorebar());
+    MM.status('<span class="chip" style="background:' + HEX[turn] + '">' + label(turn) +
+      ' — swing ' + (knocked.length + 1) + ' of 3</span>');
+
+    const { w, h } = dims();
+    const cv = MM.el('canvas', { width: w, height: h, style: { width: w + 'px', maxWidth: '100%', height: 'auto', touchAction: 'manipulation', borderRadius: '18px', background: 'linear-gradient(#eaf4ff,#f7fbff)' } });
+    panel.appendChild(cv);
+    const g = cv.getContext('2d');
+
+    // knocked-so-far readout
+    const readout = MM.el('div', { style: { fontWeight: '800', fontSize: '18px', margin: '8px 0 2px', minHeight: '1.2em' } },
+      knocked.length ? ('Knocked down: ' + knocked.join(', ')) : 'No blocks knocked yet.');
+    panel.appendChild(readout);
+
+    // pivot + pendulum geometry
+    const pivot = { x: w / 2, y: h * 0.14 };
+    const ropeLen = h * 0.60;
+    const AMP = 0.95;                 // max swing angle (radians from vertical)
+    // block layout along the bottom arc (angles), left=1 mid=3 right=9? Put 9 in
+    // middle for reachability feel; order left→right: 1, 9, 3 doesn't matter for
+    // math. We'll place 1 (left), 3 (mid), 9 (right).
+    const groundY = pivot.y + ropeLen + 12;
+    const blockDefs = [
+      { v: 1, ang: -0.62, color: '#3a86ff' },
+      { v: 3, ang: 0.00,  color: '#2ec4b6' },
+      { v: 9, ang: 0.62,  color: '#8338ec' },
+    ];
+    // which blocks are still standing this turn (each can only be knocked once)
+    const standing = {};
+    blockDefs.forEach(b => standing[b.v] = !knocked.includes(b.v));
+
+    // position of a block's center given its swing-arc angle
+    function blockPos(ang) {
+      return { x: pivot.x + Math.sin(ang) * ropeLen, y: pivot.y + Math.cos(ang) * ropeLen };
+    }
+
+    let phase = 'ready';             // 'ready' -> 'swinging' -> 'result'
+    let t0 = 0;
+    let angle = -AMP * 0.4;          // resting-ish start angle
+    let raf = 0;
+    let smashed = false;
+    let resultText = '';
+
+    const bw = Math.max(48, Math.min(74, w * 0.15));  // block draw size
+
+    function draw() {
+      g.clearRect(0, 0, w, h);
+      // ground
+      g.fillStyle = '#d9c7a8';
+      g.fillRect(0, groundY + bw * 0.5, w, h - (groundY + bw * 0.5));
+      // pivot post
+      g.fillStyle = '#8a6d3b';
+      g.fillRect(pivot.x - 6, 8, 12, pivot.y - 6);
+      g.beginPath(); g.arc(pivot.x, pivot.y, 8, 0, 7); g.fillStyle = '#5c4523'; g.fill();
+
+      // blocks
+      blockDefs.forEach(b => {
+        const p = blockPos(b.ang);
+        const y = groundY;                      // rest on the ground line
+        if (standing[b.v]) {
+          roundRect(g, p.x - bw / 2, y - bw, bw, bw, 10);
+          g.fillStyle = b.color; g.fill();
+          g.fillStyle = '#ffffff';
+          g.font = '800 ' + Math.floor(bw * 0.5) + 'px system-ui, sans-serif';
+          g.textAlign = 'center'; g.textBaseline = 'middle';
+          g.fillText(String(b.v), p.x, y - bw / 2);
+        } else {
+          // knocked block: draw toppled + rubble
+          g.globalAlpha = 0.5;
+          roundRect(g, p.x - bw / 2, y - bw * 0.42, bw, bw * 0.42, 8);
+          g.fillStyle = b.color; g.fill();
+          g.globalAlpha = 1;
+          g.font = '' + Math.floor(bw * 0.5) + 'px serif';
+          g.fillText('💥', p.x, y - bw * 0.5);
+        }
+      });
+
+      // rope + ball
+      const bx = pivot.x + Math.sin(angle) * ropeLen;
+      const by = pivot.y + Math.cos(angle) * ropeLen;
+      g.strokeStyle = '#7a6a52'; g.lineWidth = 4;
+      g.beginPath(); g.moveTo(pivot.x, pivot.y); g.lineTo(bx, by); g.stroke();
+      // ball
+      const r = bw * 0.42;
+      const grd = g.createRadialGradient(bx - r * 0.3, by - r * 0.3, r * 0.2, bx, by, r);
+      grd.addColorStop(0, '#9aa0a6'); grd.addColorStop(1, '#4a4f55');
+      g.beginPath(); g.arc(bx, by, r, 0, 7); g.fillStyle = grd; g.fill();
+      g.lineWidth = 3; g.strokeStyle = '#2f3338'; g.stroke();
+    }
+
+    function frame(ts) {
+      if (phase !== 'swinging') return;
+      if (!t0) t0 = ts;
+      const el = (ts - t0) / 1000;
+      // pendulum: gentle, forgiving period ~1.7s
+      angle = AMP * Math.cos(el * (2 * Math.PI / 1.7));
+      draw();
+      raf = requestAnimationFrame(frame);
+    }
+
+    function currentBall() { return { x: pivot.x + Math.sin(angle) * ropeLen, y: pivot.y + Math.cos(angle) * ropeLen }; }
+
+    function smash() {
+      if (phase !== 'swinging' || smashed) return;
+      smashed = true;
+      cancelAnimationFrame(raf);
+      phase = 'result';
+      MM.sound.play('roll');
+      // find nearest STANDING block by horizontal distance from the ball
+      const ball = currentBall();
+      let hitV = null, bestD = Infinity;
+      blockDefs.forEach(b => {
+        if (!standing[b.v]) return;
+        const p = blockPos(b.ang);
+        const d = Math.abs(p.x - ball.x);
+        if (d < bestD) { bestD = d; hitV = b.v; }
+      });
+      // forgiving hit window: within ~65% of a block width counts
+      const win = bw * 0.9;
+      if (hitV != null && bestD <= win) {
+        standing[hitV] = false;
+        knocked.push(hitV);
+        MM.sound.play('pop');
+        resultText = '💥 Smash! You knocked down ' + hitV + '!';
+        draw();
+        MM.confetti({ count: 26, x: pivot.x, y: dims().h * 0.45 });
+      } else {
+        MM.sound.play('swoosh');
+        resultText = '😅 Just missed! No block that time.';
+        draw();
+      }
+      showResult();
+    }
+
+    function showResult() {
+      readout.textContent = resultText + (knocked.length ? '  (so far: ' + knocked.join(', ') + ')' : '');
+      controls.innerHTML = '';
+      const anyStanding = blockDefs.some(b => standing[b.v]);
+      if (knocked.length < 3 && anyStanding) {
+        controls.appendChild(bigBtn('🔨 Next swing', HEX[turn], () => swingPhase(knocked)));
+      }
+      controls.appendChild(bigBtn('✅ Stop & do math', '#2ec4b6', () => combinePhase(knocked)));
+    }
+
+    // controls area
+    const controls = MM.el('div', { class: 'mm-row', style: { marginTop: '10px' } });
+    const swingBtn = bigBtn('🟢 Swing!', HEX[turn], () => {
+      if (phase !== 'ready') return;
+      phase = 'swinging'; t0 = 0; MM.sound.play('swoosh');
+      swingBtn.replaceWith(smashBtn);
+      raf = requestAnimationFrame(frame);
+    });
+    const smashBtn = bigBtn('🔨 Smash!', '#ff5a5f', smash);
+    controls.appendChild(swingBtn);
+    // if there are no blocks left standing (all 3 knocked) skip straight to math
+    if (!blockDefs.some(b => standing[b.v])) {
+      controls.innerHTML = '';
+      controls.appendChild(bigBtn('✅ Do the math', '#2ec4b6', () => combinePhase(knocked)));
+    }
+    panel.appendChild(controls);
+    panel.appendChild(MM.el('div', { class: 'mm-hint' }, 'Tap Swing, then tap Smash when the ball is over the block you want!'));
+
+    draw();
+  }
+
+  /* ---------- COMBINE PHASE: choose + / − for each knocked value ---------- */
+  function combinePhase(knocked) {
+    panel.innerHTML = '';
+    panel.appendChild(scorebar());
+    MM.status('<span class="chip" style="background:' + HEX[turn] + '">' + label(turn) + ' — make a number!</span>');
+
+    if (knocked.length === 0) {
+      panel.appendChild(MM.el('h2', { style: { marginTop: '4px' } }, 'No blocks knocked down 😅'));
+      panel.appendChild(MM.el('div', { class: 'mm-hint' }, 'That turn made no number. Better luck next swing!'));
+      panel.appendChild(bigBtn('👉 End turn', HEX[turn], () => endTurn()));
+      return;
+    }
+
+    // signs[i] in {+1,-1}; first defaults to +
+    const signs = knocked.map(() => 1);
+
+    function total() { return knocked.reduce((s, v, i) => s + v * signs[i], 0); }
+    function valid(t) { return t >= 1 && t <= TARGET && !P[turn].card[t]; }
+
+    const eqLine = MM.el('div', { style: { fontSize: '30px', fontWeight: '800', margin: '10px 0' } });
+    const totalLine = MM.el('div', { style: { fontSize: '24px', fontWeight: '800', margin: '2px 0 10px' } });
+    const markHint = MM.el('div', { class: 'mm-hint' });
+
+    panel.appendChild(MM.el('h2', { style: { marginTop: '4px' } }, 'Add or subtract to make a number'));
+
+    // sign toggle buttons per knocked value
+    const signRow = MM.el('div', { class: 'mm-row', style: { margin: '6px 0' } });
+    knocked.forEach((v, i) => {
+      const b = MM.el('button', {
+        class: 'mm-btn',
+        style: { minWidth: '86px', minHeight: '52px', fontSize: '20px', background: i === 0 ? '#8338ec' : '#ff9f1c' },
+      });
+      function upd() {
+        if (i === 0) { b.textContent = String(v); b.style.background = '#3a86ff'; }
+        else { b.textContent = (signs[i] > 0 ? '➕ ' : '➖ ') + v; b.style.background = signs[i] > 0 ? '#2ec4b6' : '#ff9f1c'; }
+      }
+      b.addEventListener('click', () => {
+        if (i === 0) return;      // first value is always positive (start of sum)
+        signs[i] *= -1; MM.sound.play('click'); upd(); refresh();
+      });
+      upd();
+      signRow.appendChild(b);
+    });
+
+    function refresh() {
+      const parts = knocked.map((v, i) => (i === 0 ? '' : (signs[i] > 0 ? ' + ' : ' − ')) + v);
+      eqLine.textContent = parts.join('');
+      const t = total();
+      totalLine.innerHTML = '= <span style="color:' + HEX[turn] + '">' + t + '</span>';
+      const ok = valid(t);
+      crossBtn.disabled = !ok;
+      markHint.textContent = ok
+        ? 'Tap "Cross off ' + t + '" to mark it on your card!'
+        : (t < 1 || t > TARGET ? 'That total (' + t + ') is not on the 1–13 card. Try + / −.'
+                               : 'You already crossed off ' + t + '. Make a different number!');
+      crossBtn.textContent = ok ? ('✂️ Cross off ' + t) : ('Total: ' + t);
+    }
+
+    const crossBtn = bigBtn('✂️ Cross off', '#2ec4b6', () => {
+      const t = total();
+      if (!valid(t)) return;
+      P[turn].card[t] = true;
+      MM.sound.play('ding');
+      MM.confetti({ count: 40 });
+      afterMark(t);
+    });
+
+    panel.append(signRow, eqLine, totalLine, markHint);
+    panel.appendChild(MM.el('div', { class: 'mm-row', style: { marginTop: '4px' } },
+      crossBtn,
+      bigBtn('🙅 Skip turn', '#ff5a5f', () => { MM.sound.play('click'); endTurn(); })));
+
+    // show the card too so kids see progress
+    panel.appendChild(MM.el('div', { style: { marginTop: '14px' } }, cardEl(turn)));
+
+    refresh();
+  }
+
+  function afterMark(t) {
+    if (cardDone(turn)) { finish(turn); return; }
+    endTurn();
+  }
+
+  function endTurn() {
+    if (solo) {
+      turnsTaken++;
+      if (cardDone(1)) { finish(1); return; }
+      beginTurn();
+      return;
+    }
+    turn = turn === 1 ? 2 : 1;
+    beginTurn();
+  }
+
+  /* =========================================================================
+     AI TURN — takes up to 3 auto-swings (each hits its aimed block most of the
+     time), aiming for blocks that let it complete a number it still needs.
+     ========================================================================= */
+  async function aiTurn() {
+    panel.innerHTML = '';
+    panel.appendChild(scorebar());
+    MM.status('<span class="chip" style="background:' + HEX[2] + '">Computer is swinging…</span>');
+    const stage = MM.el('div', { style: { fontSize: '52px', margin: '18px 0' } }, '🏗️🔨');
+    const line = MM.el('div', { style: { fontWeight: '800', fontSize: '20px', minHeight: '1.4em' } }, 'The robot lines up a swing…');
+    panel.append(stage, line);
+
+    // decide the plan: find a needed number reachable with balanced-ternary
+    // using a subset of {1,3,9}. Choose target that uses the FEWEST blocks.
+    const need = [];
+    for (let n = 1; n <= TARGET; n++) if (!P[2].card[n]) need.push(n);
+    const plan = pickAIPlan(need);      // {value, blocks:[...], signs:{}} or null
+
+    const knocked = [];
+    const wantBlocks = plan ? plan.blocks.slice() : MM.shuffle(BLOCKS.slice()).slice(0, 2);
+
+    for (let s = 0; s < 3 && wantBlocks.length; s++) {
+      const target = wantBlocks.shift();
+      line.textContent = 'Swing ' + (s + 1) + ': aiming for block ' + target + '…';
+      await MM.sleep(700);
+      // ~80% success; forgiving like the human window
+      if (Math.random() < 0.82) {
+        knocked.push(target);
+        MM.sound.play('pop');
+        line.textContent = '💥 Knocked down ' + target + '!';
+      } else {
+        MM.sound.play('swoosh');
+        line.textContent = '😅 The robot just missed.';
+      }
+      await MM.sleep(650);
+    }
+
+    // combine: find the best number the robot can actually make & needs
+    const made = bestNumberFrom(knocked, P[2].card);
+    await MM.sleep(400);
+    if (made != null) {
+      P[2].card[made] = true;
+      MM.sound.play('ding');
+      line.innerHTML = 'Computer makes <b style="color:' + HEX[2] + '">' + made + '</b> and crosses it off! ✂️';
+      MM.confetti({ count: 30 });
+      await MM.sleep(1100);
+      if (cardDone(2)) { finish(2); return; }
+    } else {
+      line.textContent = knocked.length ? 'Computer could not make a new number this turn.' : 'The robot knocked down nothing!';
+      await MM.sleep(1100);
+    }
+    turn = 1;
+    beginTurn();
+  }
+
+  // choose a needed value with a minimal block subset (fewest swings)
+  function pickAIPlan(need) {
+    const combos = allCombos();     // [{value, blocks}] over subsets of {1,3,9}
+    let best = null;
+    for (const n of MM.shuffle(need.slice())) {
+      const options = combos.filter(c => c.value === n);
+      if (!options.length) continue;
+      options.sort((a, b) => a.blocks.length - b.blocks.length);
+      const cand = options[0];
+      if (!best || cand.blocks.length < best.blocks.length) best = { value: n, blocks: cand.blocks };
+    }
+    return best;
+  }
+
+  // best (needed, in-range, not-crossed) number makeable from a set of knocked blocks
+  function bestNumberFrom(knocked, card) {
+    if (!knocked.length) return null;
+    const uniq = Array.from(new Set(knocked));
+    const combos = combosFromBlocks(uniq);   // all ± totals using each block once
+    const options = combos.filter(t => t >= 1 && t <= TARGET && !card[t]);
+    if (!options.length) return null;
+    // prefer the largest still-needed (arbitrary but fine)
+    return options.sort((a, b) => b - a)[0];
+  }
+
+  // all ± totals from a specific set of block values (each used once)
+  function combosFromBlocks(vals) {
+    let totals = [0];
+    for (const v of vals) {
+      const next = [];
+      for (const t of totals) { next.push(t + v); next.push(t - v); }
+      totals = next;
+    }
+    return totals;
+  }
+
+  // enumerate every non-empty subset of {1,3,9} with every ± total
+  function allCombos() {
+    const out = [];
+    const subs = [[1], [3], [9], [1, 3], [1, 9], [3, 9], [1, 3, 9]];
+    for (const s of subs) for (const t of combosFromBlocks(s)) out.push({ value: t, blocks: s.slice() });
+    return out;
+  }
+
+  /* ---------- finish ---------- */
+  function finish(winner) {
+    over = true;
+    if (solo) {
+      let sub = 'You cleared your 1–13 card in ' + turnsTaken + ' turns!';
+      if (best == null || turnsTaken < best) { MM.store('wreck-best', turnsTaken); sub += ' 🌟 New best!'; }
+      else sub += ' (Best: ' + best + ')';
+      MM.win({ title: 'Card cleared! 🎉', emoji: '🏆', sub, onAgain: () => MM.toMenu() });
+      return;
+    }
+    if (vsAI) {
+      const youWin = winner === 1;
+      MM.win({ lose: !youWin, title: youWin ? 'You win! 🎉' : 'Computer wins!',
+        emoji: youWin ? '🏆' : '🤖',
+        sub: youWin ? 'You crossed off all of 1–13!' : 'The robot cleared its card first. Rematch?',
+        onAgain: () => MM.toMenu() });
+      return;
+    }
+    MM.win({ title: label(winner) + ' wins! 🎉', emoji: winner === 1 ? '🔵' : '🔴',
+      sub: label(winner) + ' crossed off every number 1–13!', onAgain: () => MM.toMenu() });
+  }
+
+  /* ---------- helpers ---------- */
+  function bigBtn(text, bg, onClick) {
+    return MM.el('button', {
+      class: 'mm-btn', style: { fontSize: '19px', padding: '13px 24px', minHeight: '54px', background: bg },
+      onClick: () => onClick(),
+    }, text);
+  }
+  function roundRect(g, x, y, w, h, r) {
+    g.beginPath();
+    g.moveTo(x + r, y);
+    g.arcTo(x + w, y, x + w, y + h, r);
+    g.arcTo(x + w, y + h, x, y + h, r);
+    g.arcTo(x, y + h, x, y, r);
+    g.arcTo(x, y, x + w, y, r);
+    g.closePath();
+  }
+
+  beginTurn();
+}
+</script>
+</body>
+</html>

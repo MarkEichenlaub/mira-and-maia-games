@@ -1,0 +1,442 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Tens Go Fish</title>
+<link rel="stylesheet" href="../../assets/common.css">
+</head>
+<body>
+<script src="../../assets/common.js"></script>
+<script>
+/* TENS GO FISH — make pairs that add to 10.
+   Deck: values 1..9, four of each (Ace=1; 10s & faces removed) = 36 cards.
+   Deal 5 each; rest is the face-down pond.
+   Turn: (1) draw up to 5 if short, (2) lay down any 10-pairs in hand,
+   (3) ask another player for a value you need. Hit → take it, lay pair, ask
+   again. Miss → "Go Fish!" draw one, turn ends. Game ends when pond and hands
+   are empty. MOST cards laid down wins.
+
+   AI: tracks values opponents have asked for (they must hold the partner), lays
+   all pairs each turn, and asks for the partner it is most likely to get. */
+
+const HEX = { 1: '#3a86ff', 2: '#ff5a5f' };
+const PARTNER = v => 10 - v;            // partner value that makes 10
+
+MM.game({
+  title: 'Tens Go Fish', emoji: '🎣',
+  ba: 'https://beastacademy.com/playground/tens-go-fish',
+  rules: `
+    <p><b>Catch pairs that add up to 10!</b> The deck has number cards <b>1–9</b> (four of each).</p>
+    <ol>
+      <li>You get <b>5 cards</b>. The rest go face-down in the <b>pond</b> 🎣.</li>
+      <li>On your turn, first fill your hand back to 5 from the pond.</li>
+      <li>Lay down any two cards that make <b>10</b> (like 3+7 or 6+4).</li>
+      <li>Then <b>ask</b> the other player for a card you need. Tap one of your cards,
+          and you'll ask for its partner to 10!</li>
+      <li>If they have it — you take it, lay the pair, and ask again! If not, it's
+          <b>"Go Fish!"</b> — draw one card and your turn ends.</li>
+      <li>When the pond and hands are empty, whoever laid down the <b>most cards wins</b> 🏆</li>
+    </ol>
+    <p>Tip: 1+9, 2+8, 3+7, 4+6, and 5+5 all make ten!</p>`,
+  modes: [
+    { id: 'ai',  emoji: '🤖', name: 'Vs Computer', sub: 'You vs the robot angler' },
+    { id: 'two', emoji: '🧑‍🤝‍🧑', name: '2 Players', sub: 'Pass & play, hide hands' },
+  ],
+  onStart,
+});
+
+function onStart(mode, mount) {
+  const vsAI = (mode === 'ai');
+  const HUMAN = 1, OTHER = 2;
+
+  // ---- game state ----
+  let pond = [];                        // face-down draw pile (array of values)
+  let hands = { 1: [], 2: [] };         // player hands
+  let laid = { 1: [], 2: [] };          // laid-down pairs: array of [a,b]
+  let turn = 1;
+  let selected = null;                  // index into current player's hand (human pick)
+  let busy = false;                     // lock input during animations
+  // AI memory: values each player is KNOWN to hold (because they asked for the
+  // partner). Keyed by player -> Set of values.
+  let known = { 1: new Set(), 2: new Set() };
+
+  const panel = MM.el('div', { class: 'mm-panel mm-bounce-in' });
+  mount.appendChild(panel);
+
+  function label(pl) {
+    if (!vsAI) return 'Player ' + pl;
+    return pl === 1 ? 'You' : 'Computer';
+  }
+  function other(pl) { return pl === 1 ? 2 : 1; }
+
+  // ---- build & shuffle deck ----
+  function newDeck() {
+    const d = [];
+    for (let v = 1; v <= 9; v++) for (let k = 0; k < 4; k++) d.push(v);
+    return MM.shuffle(d);
+  }
+
+  // ---- scorebar ----
+  function scorebar() {
+    return MM.el('div', { class: 'mm-scorebar' },
+      MM.el('div', { class: 'mm-score' + (turn === 1 ? ' active' : '') },
+        MM.el('span', { class: 'dot', style: { background: HEX[1] } }),
+        MM.el('span', {}, label(1) + ': ' + laid[1].length + ' cards')),
+      MM.el('div', { class: 'mm-score' },
+        MM.el('span', {}, '🎣 Pond: ' + pond.length)),
+      MM.el('div', { class: 'mm-score' + (turn === 2 ? ' active' : '') },
+        MM.el('span', { class: 'dot', style: { background: HEX[2] } }),
+        MM.el('span', {}, label(2) + ': ' + laid[2].length + ' cards')));
+  }
+
+  // ---- laid-down tray ----
+  function trayFor(pl) {
+    const wrap = MM.el('div', {
+      style: {
+        display: 'flex', gap: '4px', flexWrap: 'wrap', justifyContent: 'center',
+        minHeight: '30px', margin: '4px 0',
+      },
+    });
+    if (laid[pl].length === 0) {
+      wrap.appendChild(MM.el('span', { class: 'mm-hint', style: { margin: '0' } }, 'no pairs yet'));
+    }
+    laid[pl].forEach(([a, b]) => {
+      const chip = MM.el('div', {
+        style: {
+          display: 'inline-flex', alignItems: 'center', gap: '2px',
+          background: '#eef7f5', border: '2px solid #2ec4b6', borderRadius: '10px',
+          padding: '2px 8px', fontWeight: '800', fontSize: '15px', color: '#0f7d72',
+        },
+      }, a + '+' + b);
+      wrap.appendChild(chip);
+    });
+    return wrap;
+  }
+
+  // ---- a small card element (uses MM.card) ----
+  function cardEl(v, opts) {
+    opts = opts || {};
+    const c = MM.card(opts.back ? '' : v, { back: !!opts.back, color: opts.color });
+    c.style.width = '48px'; c.style.height = '68px'; c.style.fontSize = '24px';
+    if (opts.sel) c.classList.add('sel');
+    if (opts.on) { c.style.cursor = 'pointer'; c.addEventListener('click', opts.on); }
+    return c;
+  }
+
+  // ================= rendering =================
+  function render(message, opts) {
+    opts = opts || {};
+    panel.innerHTML = '';
+    panel.appendChild(scorebar());
+
+    // Opponent area (top) — face-down unless it's their obvious hand
+    const oppPl = other(turn);
+    const oppWrap = MM.el('div', { class: 'mm-center', style: { margin: '4px 0 8px' } });
+    oppWrap.appendChild(MM.el('div', { style: { fontWeight: '800', color: HEX[oppPl], marginBottom: '2px' } },
+      label(oppPl) + ' — ' + hands[oppPl].length + ' card' + (hands[oppPl].length === 1 ? '' : 's')));
+    const oppRow = MM.el('div', { style: { display: 'flex', gap: '4px', justifyContent: 'center', flexWrap: 'wrap' } });
+    for (let i = 0; i < hands[oppPl].length; i++) oppRow.appendChild(cardEl(0, { back: true }));
+    oppWrap.appendChild(oppRow);
+    oppWrap.appendChild(trayFor(oppPl));
+    panel.appendChild(oppWrap);
+
+    // Pond in the middle
+    const pondWrap = MM.el('div', { class: 'mm-center', style: { margin: '6px 0' } });
+    const pondCard = pond.length ? cardEl(0, { back: true }) : MM.el('div', {
+      style: {
+        width: '48px', height: '68px', borderRadius: '12px', border: '3px dashed #c9c1d8',
+        display: 'inline-flex', alignItems: 'center', justifyContent: 'center', fontSize: '22px',
+      },
+    }, '🎣');
+    pondWrap.appendChild(MM.el('div', { style: { display: 'inline-flex', flexDirection: 'column', alignItems: 'center', gap: '2px' } },
+      pondCard,
+      MM.el('div', { class: 'mm-hint', style: { margin: '0' } }, 'Pond: ' + pond.length)));
+    panel.appendChild(pondWrap);
+
+    // Current player's own tray + hand
+    const meWrap = MM.el('div', { class: 'mm-center', style: { marginTop: '8px' } });
+    meWrap.appendChild(MM.el('div', { style: { fontWeight: '800', color: HEX[turn] } },
+      label(turn) + '’s hand'));
+    meWrap.appendChild(trayFor(turn));
+
+    const handRow = MM.el('div', {
+      id: 'mm-hand',
+      style: { display: 'flex', gap: '6px', justifyContent: 'center', flexWrap: 'wrap', margin: '6px 0' },
+    });
+    const interactive = !busy && (turn === HUMAN || !vsAI) && opts.interactive !== false;
+    hands[turn].forEach((v, i) => {
+      handRow.appendChild(cardEl(v, {
+        color: HEX[turn], sel: selected === i,
+        on: interactive ? () => pickCard(i) : null,
+      }));
+    });
+    meWrap.appendChild(handRow);
+    panel.appendChild(meWrap);
+
+    if (message) panel.appendChild(MM.el('div', { class: 'mm-hint', style: { fontSize: '16px', marginTop: '8px' } , html: message }));
+  }
+
+  // ================= core rules =================
+  // find one 10-pair in a hand; returns [i,j] indices or null
+  function findPair(hand) {
+    for (let i = 0; i < hand.length; i++)
+      for (let j = i + 1; j < hand.length; j++)
+        if (hand[i] + hand[j] === 10) return [i, j];
+    return null;
+  }
+
+  // lay down all available pairs for player pl, animating each; returns count laid
+  async function layAllPairs(pl) {
+    let count = 0;
+    let pair = findPair(hands[pl]);
+    while (pair) {
+      const [i, j] = pair;
+      const a = hands[pl][i], b = hands[pl][j];
+      // remove higher index first
+      const hi = Math.max(i, j), lo = Math.min(i, j);
+      hands[pl].splice(hi, 1); hands[pl].splice(lo, 1);
+      laid[pl].push([Math.min(a, b), Math.max(a, b)]);
+      count++;
+      MM.sound.play('place');
+      render('✅ Laid down <b>' + Math.min(a, b) + ' + ' + Math.max(a, b) + ' = 10</b>!');
+      await MM.sleep(520);
+      pair = findPair(hands[pl]);
+    }
+    return count;
+  }
+
+  // draw up to 5 from pond into hand pl (animated)
+  async function drawUpTo5(pl) {
+    let drew = 0;
+    while (hands[pl].length < 5 && pond.length > 0) {
+      hands[pl].push(pond.pop());
+      drew++;
+      MM.sound.play('deal');
+      render(drew === 1 ? '🎣 Drawing back up to 5…' : '🎣 Drawing back up to 5…');
+      await MM.sleep(260);
+    }
+    return drew;
+  }
+
+  // ================= turn flow =================
+  async function beginTurn() {
+    selected = null;
+    busy = true;
+    render();
+    await MM.sleep(200);
+    // (1) draw up to 5
+    await drawUpTo5(turn);
+    // (2) lay all pairs
+    await layAllPairs(turn);
+    // check end
+    if (isGameOver()) { finish(); return; }
+    busy = false;
+    if (turn === HUMAN && vsAI) {
+      render('👉 Tap one of your cards to ask <b>' + label(other(turn)) +
+        '</b> for its partner to 10.');
+    } else if (!vsAI) {
+      render('👉 <span style="color:' + HEX[turn] + '">' + label(turn) +
+        '</span>, tap a card to ask for its partner to 10.');
+    }
+    if (vsAI && turn === OTHER) { busy = true; render(); await MM.sleep(600); aiAsk(); }
+  }
+
+  function isGameOver() {
+    return pond.length === 0 && hands[1].length === 0 && hands[2].length === 0;
+  }
+
+  function pickCard(i) {
+    if (busy) return;
+    if (selected === i) {
+      // second tap on same card → confirm the ask
+      const need = PARTNER(hands[turn][i]);
+      if (need < 1 || need > 9) { MM.sound.play('wrong'); selected = null; render('That card can’t make 10 with a partner. Pick another!'); return; }
+      doAsk(need, hands[turn][i]);
+      return;
+    }
+    selected = i;
+    MM.sound.play('click');
+    const have = hands[turn][i];
+    const need = PARTNER(have);
+    render('You have a <b>' + have + '</b>. Its partner is <b>' + need +
+      '</b>. Tap the card again to ask <b>' + label(other(turn)) + '</b> for a ' + need + '! 🎣');
+  }
+
+  // current player asks `other` for value `need`
+  async function doAsk(need, myCard) {
+    busy = true; selected = null;
+    const asker = turn, target = other(turn);
+    MM.sound.play('swoosh');
+    render('❓ <span style="color:' + HEX[asker] + '">' + label(asker) +
+      '</span> asks <span style="color:' + HEX[target] + '">' + label(target) +
+      '</span>: <b>“Got a ' + need + '?”</b>');
+    // record memory: asker holds `myCard` (they asked for its partner)
+    remember(asker, myCard);
+    await MM.sleep(800);
+
+    const idx = hands[target].indexOf(need);
+    if (idx !== -1) {
+      // HIT — take card, lay pair, ask again
+      hands[target].splice(idx, 1);
+      // asker had `myCard`; place both as a laid pair
+      const mi = hands[asker].indexOf(myCard);
+      if (mi !== -1) hands[asker].splice(mi, 1);
+      laid[asker].push([Math.min(myCard, need), Math.max(myCard, need)]);
+      forget(target, need); forget(asker, myCard);
+      MM.sound.play('ding'); MM.sound.play('place');
+      render('🎉 Yes! Took a <b>' + need + '</b> and laid <b>' +
+        Math.min(myCard, need) + ' + ' + Math.max(myCard, need) + ' = 10</b>!');
+      await MM.sleep(700);
+      // lay any freshly-completable pairs too, then continue asking
+      await layAllPairs(asker);
+      if (isGameOver()) { finish(); return; }
+      busy = false;
+      if (hands[asker].length === 0) {
+        // nothing to ask with — end turn
+        render('Hand empty — turn over.');
+        await MM.sleep(500);
+        endTurn();
+        return;
+      }
+      if (asker === HUMAN && vsAI) {
+        render('🎣 Nice catch! Ask again — tap a card to ask for its partner.');
+      } else if (!vsAI) {
+        render('🎣 Nice catch! Ask again — tap a card, ' + label(asker) + '.');
+      } else {
+        busy = true; render(); await MM.sleep(700); aiAsk();
+      }
+    } else {
+      // MISS — Go Fish!
+      MM.sound.play('wrong');
+      render('🎣 <b>Go Fish!</b> ' + label(target) + ' doesn’t have a ' + need + '.');
+      await MM.sleep(800);
+      if (pond.length > 0) {
+        hands[asker].push(pond.pop());
+        MM.sound.play('deal');
+        render('🎣 Drew a card from the pond.');
+        await MM.sleep(500);
+        await layAllPairs(asker);
+      }
+      if (isGameOver()) { finish(); return; }
+      endTurn();
+    }
+  }
+
+  async function endTurn() {
+    busy = true;
+    turn = other(turn);
+    if (!vsAI) {
+      await coverScreen(turn);
+    }
+    beginTurn();
+  }
+
+  // ================= AI memory helpers =================
+  function remember(pl, value) { known[pl].add(value); }
+  function forget(pl, value) {
+    // remove one instance of "knowing" — approximate; keep it simple
+    known[pl].delete(value);
+  }
+
+  // ================= AI =================
+  // The AI knows its own hand. It uses `known[HUMAN]` (values the human asked
+  // for, meaning the human holds the partner-of-that-ask... actually the human
+  // holds the value they asked *with*). We track the card the asker revealed
+  // they hold. So known[HUMAN] = values the human is known to hold.
+  async function aiAsk() {
+    const me = OTHER, opp = other(me);
+    busy = true;
+    if (hands[me].length === 0) { render(); await MM.sleep(300); endTurn(); return; }
+
+    // For each distinct value I hold, its partner is what I'd ask for.
+    // Score candidates: prefer a partner the opponent is KNOWN to hold.
+    const myVals = Array.from(new Set(hands[me]));
+    let best = null, bestScore = -1;
+    for (const v of myVals) {
+      const need = PARTNER(v);
+      if (need < 1 || need > 9) continue;
+      let score = 1;                                 // base
+      if (known[opp].has(need)) score += 100;        // known hit!
+      // fewer partners already gone from play → likelier still around
+      score += Math.random() * 0.5;                  // tie-break jitter
+      if (score > bestScore) { bestScore = score; best = { v, need }; }
+    }
+    if (!best) {
+      // no valid ask (shouldn't happen with values 1-9) — end turn
+      render(); await MM.sleep(300); endTurn(); return;
+    }
+    // narrate the AI's ask through doAsk
+    await doAsk(best.need, best.v);
+  }
+
+  // ================= 2-player cover screen =================
+  function coverScreen(who) {
+    return new Promise(resolve => {
+      panel.innerHTML = '';
+      panel.appendChild(scorebar());
+      panel.appendChild(MM.el('div', { class: 'mm-center', style: { padding: '22px 6px' } },
+        MM.el('div', { style: { fontSize: '64px' } }, '🙈'),
+        MM.el('h2', {}, 'Pass the device to'),
+        MM.el('div', { style: { fontSize: '26px', fontWeight: '800', color: HEX[who], margin: '4px 0 14px' } }, label(who)),
+        MM.el('div', { class: 'mm-hint' }, 'No peeking, ' + label(other(who)) + '! 👀'),
+        MM.el('button', {
+          class: 'mm-btn', style: { fontSize: '20px', padding: '14px 30px', minHeight: '54px', background: HEX[who] },
+          onClick: () => { MM.sound.play('swoosh'); resolve(); },
+        }, '👉 I’m ' + label(who) + ' — ready!')));
+      MM.status('<span class="chip" style="background:' + HEX[who] + '">' + label(who) + '’s turn</span>');
+    });
+  }
+
+  // ================= finish =================
+  function finish() {
+    busy = true;
+    render('🏁 Pond and hands are empty!');
+    const s1 = laid[1].length, s2 = laid[2].length;
+    const winner = s1 > s2 ? 1 : s2 > s1 ? 2 : 0;
+    setTimeout(() => {
+      if (winner === 0) {
+        MM.win({ title: "It’s a tie! 🤝", emoji: '🎣',
+          sub: 'You each laid ' + s1 + ' cards. Rematch?', onAgain: () => MM.toMenu() });
+      } else if (vsAI) {
+        const youWin = winner === 1;
+        MM.win({ lose: !youWin,
+          title: youWin ? 'You win! 🎉' : 'Computer wins!',
+          emoji: youWin ? '🏆' : '🤖',
+          sub: 'You laid ' + s1 + ' cards, computer laid ' + s2 + '.',
+          onAgain: () => MM.toMenu() });
+      } else {
+        MM.win({ title: label(winner) + ' wins! 🎉', emoji: winner === 1 ? '🔵' : '🔴',
+          sub: label(1) + ' laid ' + s1 + ', ' + label(2) + ' laid ' + s2 + '.',
+          onAgain: () => MM.toMenu() });
+      }
+    }, 700);
+  }
+
+  // ================= deal & start =================
+  async function deal() {
+    busy = true;
+    pond = newDeck();
+    hands = { 1: [], 2: [] };
+    laid = { 1: [], 2: [] };
+    known = { 1: new Set(), 2: new Set() };
+    render('Dealing… 🎴');
+    // deal 5 each, alternating, animated
+    for (let r = 0; r < 5; r++) {
+      for (const pl of [1, 2]) {
+        hands[pl].push(pond.pop());
+        MM.sound.play('deal');
+        render('Dealing 5 cards each… 🎴');
+        await MM.sleep(140);
+      }
+    }
+    turn = 1;
+    if (!vsAI) await coverScreen(1);
+    beginTurn();
+  }
+
+  deal();
+}
+</script>
+</body>
+</html>

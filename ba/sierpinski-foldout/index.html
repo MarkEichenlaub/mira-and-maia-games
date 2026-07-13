@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Fractal Fold-Out</title>
+<link rel="stylesheet" href="../../assets/common.css">
+</head>
+<body>
+<script src="../../assets/common.js"></script>
+<script>
+/* FRACTAL FOLD-OUT — a Sierpinski triangle grows by a doubling rule.
+   Level L has 3^L little triangles, but the "pop-out steps" the kid counts
+   double each level: 1, 2, 4, 8, 16, 32 (powers of two). We draw the
+   Sierpinski triangle on Canvas and animate each new level popping in. */
+
+const MAXL = 5;
+const HEX = ['#3a86ff', '#ff5a5f', '#2ec4b6', '#8338ec', '#ff9f1c', '#ff70a6'];
+
+MM.game({
+  title: 'Fractal Fold-Out', emoji: '🔺',
+  ba: 'https://beastacademy.com/playground/sierpinski-foldout',
+  rules: `
+    <p><b>A fractal is a shape made of smaller copies of itself!</b> 🔁</p>
+    <p>Start with <b>1</b> big triangle. Fold it out and it becomes made of little
+    triangles. Fold again… and each little triangle is made of even littler ones.
+    It looks the same close up as far away — that's called <b>self-similar</b>.</p>
+    <p>Watch the <b>doubling pattern</b> as you fold deeper:</p>
+    <ul>
+      <li>Level 0 → <b>1</b> &nbsp;(that's 2⁰)</li>
+      <li>Level 1 → <b>2</b> &nbsp;(2×1 = 2¹)</li>
+      <li>Level 2 → <b>4</b> &nbsp;(2×2 = 2²)</li>
+      <li>Level 3 → <b>8</b>, Level 4 → <b>16</b>, Level 5 → <b>32</b> …</li>
+    </ul>
+    <p>Every fold <b>doubles</b> the last number. These are the <b>powers of two</b>!
+    Tap <b>Fold again ➕</b> to go deeper. 🔺</p>`,
+  onStart,
+});
+
+function onStart(mode, mount) {
+  let level = 0;
+  let animating = false;
+  let best = MM.load('fractal-best', 0);
+
+  const cw = Math.min(360, window.innerWidth - 60);
+  const ch = Math.round(cw * 0.9);
+
+  const canvas = MM.el('canvas', { width: cw, height: ch,
+    style: { width: cw + 'px', height: ch + 'px', touchAction: 'manipulation' } });
+  const g = canvas.getContext('2d');
+
+  // big number readout
+  const powBig = MM.el('div', { class: 'fr-pow' });
+  const powSub = MM.el('div', { class: 'fr-powsub' });
+
+  // buttons
+  const minus = MM.el('button', { class: 'mm-btn red fr-bigbtn', onClick: () => step(-1) }, '➖ Fold back');
+  const plus  = MM.el('button', { class: 'mm-btn green fr-bigbtn', onClick: () => step(+1) }, '➕ Fold again');
+  const btnRow = MM.el('div', { class: 'mm-row', style: { marginTop: '16px' } }, minus, plus);
+
+  // level pills 0..5
+  const pills = MM.el('div', { class: 'mm-pills', style: { marginTop: '14px' } });
+  const pillEls = [];
+  for (let i = 0; i <= MAXL; i++) {
+    const p = MM.el('button', { class: 'mm-pill', onClick: () => jumpTo(i) }, 'L' + i);
+    pillEls.push(p); pills.appendChild(p);
+  }
+
+  const panel = MM.el('div', { class: 'mm-panel mm-center mm-bounce-in' },
+    MM.el('div', { class: 'mm-hint', style: { marginTop: 0 } },
+      'Fold the fractal deeper and watch the number DOUBLE!'),
+    powBig, powSub, canvas, btnRow, pills);
+  mount.appendChild(panel);
+
+  // ---- geometry: the 3 corners of the outer triangle ----
+  const pad = 16;
+  const A = [cw / 2, pad];
+  const B = [pad, ch - pad];
+  const C = [cw - pad, ch - pad];
+  const mid = (p, q) => [(p[0] + q[0]) / 2, (p[1] + q[1]) / 2];
+
+  // Collect all "filled" (upward) triangles for a Sierpinski of the given depth,
+  // tagged with the recursion depth they first appear at (for pop-in animation).
+  function collect(depth) {
+    const tris = [];
+    (function rec(a, b, c, d) {
+      if (d === depth) { tris.push({ pts: [a, b, c], d }); return; }
+      const ab = mid(a, b), bc = mid(b, c), ca = mid(c, a);
+      rec(a, ab, ca, d + 1);
+      rec(ab, b, bc, d + 1);
+      rec(ca, bc, c, d + 1);
+    })(A, B, C, 0);
+    return tris;
+  }
+
+  function drawTri(pts, fill, alpha) {
+    g.globalAlpha = alpha == null ? 1 : alpha;
+    g.beginPath();
+    g.moveTo(pts[0][0], pts[0][1]);
+    g.lineTo(pts[1][0], pts[1][1]);
+    g.lineTo(pts[2][0], pts[2][1]);
+    g.closePath();
+    g.fillStyle = fill;
+    g.fill();
+    g.globalAlpha = 1;
+  }
+
+  // Render level `lvl`; `grow` in [0..1] animates the newest triangles scaling in.
+  function render(lvl, grow) {
+    g.clearRect(0, 0, cw, ch);
+    const tris = collect(lvl);
+    const col = HEX[lvl % HEX.length];
+    for (const t of tris) {
+      if (grow != null && grow < 1) {
+        // pop-in: shrink each new little triangle toward its own center
+        const cx = (t.pts[0][0] + t.pts[1][0] + t.pts[2][0]) / 3;
+        const cy = (t.pts[0][1] + t.pts[1][1] + t.pts[2][1]) / 3;
+        const s = 0.15 + 0.85 * grow;
+        const scaled = t.pts.map(p => [cx + (p[0] - cx) * s, cy + (p[1] - cy) * s]);
+        drawTri(scaled, col, 0.3 + 0.7 * grow);
+      } else {
+        drawTri(t.pts, col);
+      }
+    }
+  }
+
+  function pow2(l) { return Math.pow(2, l); }
+
+  function updateReadout() {
+    powBig.textContent = pow2(level);
+    const parts = [];
+    for (let i = 0; i <= level; i++) parts.push(pow2(i));
+    powSub.innerHTML = `2<sup>${level}</sup> = <b>${pow2(level)}</b><br>` +
+      `<span class="fr-chain">${parts.join(' → ')}</span>`;
+    pillEls.forEach((p, i) => p.setAttribute('aria-pressed', i === level ? 'true' : 'false'));
+    minus.disabled = level === 0;
+    plus.disabled = level === MAXL;
+  }
+
+  async function animateTo(target) {
+    animating = true; setBtns(true);
+    const dir = target > level ? 1 : -1;
+    MM.sound.play(dir > 0 ? 'swoosh' : 'click');
+    // animate the grow of the target level
+    const start = performance.now();
+    const dur = 420;
+    await new Promise(res => {
+      function frame(now) {
+        const t = Math.min(1, (now - start) / dur);
+        // ease-out
+        const e = 1 - Math.pow(1 - t, 3);
+        render(target, dir > 0 ? e : 1);
+        if (t < 1) requestAnimationFrame(frame); else res();
+      }
+      requestAnimationFrame(frame);
+    });
+    level = target;
+    render(level, 1);
+    updateReadout();
+    MM.sound.play('pop');
+
+    if (level > best) {
+      best = level; MM.store('fractal-best', best);
+    }
+    if (level === MAXL) {
+      const r = canvas.getBoundingClientRect();
+      MM.confetti({ count: 90, x: r.left + r.width / 2, y: r.top + r.height / 2 });
+      MM.sound.play('win');
+      MM.status(`Deepest fold! <b>2⁵ = 32</b> 🎉`);
+    } else {
+      MM.status(`Level <b>${level}</b> → <b>2<sup>${level}</sup> = ${pow2(level)}</b>`);
+    }
+    animating = false; setBtns(false);
+  }
+
+  function setBtns(disabled) {
+    // keep min/max disabling correct
+    minus.disabled = disabled || level === 0;
+    plus.disabled = disabled || level === MAXL;
+    pillEls.forEach(p => p.disabled = disabled);
+  }
+
+  function step(delta) {
+    if (animating) return;
+    const target = level + delta;
+    if (target < 0 || target > MAXL) return;
+    animateTo(target);
+  }
+
+  function jumpTo(i) {
+    if (animating || i === level) return;
+    MM.sound.play('click');
+    animateTo(i);
+  }
+
+  render(0, 1);
+  updateReadout();
+  MM.status(`Level <b>0</b> → <b>2⁰ = 1</b> big triangle`);
+}
+</script>
+<style>
+  .fr-pow {
+    font-size: clamp(64px, 20vw, 110px); font-weight: 900; line-height: 1;
+    color: var(--c-purple); text-shadow: 0 4px 0 rgba(131,56,236,.18);
+    margin: 2px 0;
+  }
+  .fr-powsub { font-size: 20px; font-weight: 800; color: var(--ink); margin-bottom: 10px; }
+  .fr-powsub sup { font-size: .7em; }
+  .fr-chain { color: var(--ink-soft); font-size: 17px; font-weight: 800; }
+  .fr-bigbtn { font-size: 19px; padding: 14px 24px; min-height: 54px; }
+  canvas { border-radius: 16px; background: #fff8ec; box-shadow: 0 6px 0 #e7e0d0; margin-top: 6px; }
+  .mm-pill { min-height: 44px; min-width: 44px; }
+</style>
+</body>
+</html>

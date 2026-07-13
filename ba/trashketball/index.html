@@ -1,0 +1,533 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Trashketball</title>
+<link rel="stylesheet" href="../../assets/common.css">
+</head>
+<body>
+<script src="../../assets/common.js"></script>
+<script>
+/* TRASHKETBALL — crumple paper, aim, and toss it into the trash can. 🗑️
+   Aim-and-shoot with a simple gravity arc. Land it in the can to score.
+
+   Scoring variants (pills):
+     • '1 point'     — each make is worth 1.
+     • 'Skip by 2/5/10' — each make adds that step; the screen counts aloud
+       (5, 10, 15, ...), great skip-counting practice.
+     • 'Odds & Evens' — each ball is labeled with a number; a make adds that
+       number to your total (mixing odd + even addition).
+
+   Skill: drag the aim line (angle + power) and release, OR tap "Toss!" after
+   setting the sliders. Motion via requestAnimationFrame, gentle + forgiving. */
+
+const HEX = { 1: '#3a86ff', 2: '#ff5a5f' };
+
+MM.game({
+  title: 'Trashketball', emoji: '🗑️',
+  ba: 'https://beastacademy.com/playground/trashketball',
+  rules: `
+    <p><b>Toss the paper into the trash can!</b> 🗑️ Aim, set your power, and let it fly.</p>
+    <ol>
+      <li><b>Drag</b> from the paper ball to aim — longer drag = more power.</li>
+      <li>Let go to <b>toss!</b> A swish 🔔 means you scored.</li>
+      <li>Pick a <b>scoring</b> style: 1 point each, skip-count by 2/5/10, or add up the numbered balls.</li>
+    </ol>
+    <p>Watch your total grow — 5, 10, 15… that's skip-counting! Most points wins. 🏆</p>`,
+  modes: [
+    { id: 'solo', emoji: '⭐', name: 'Solo',        sub: 'How many can you make?' },
+    { id: 'ai',   emoji: '🤖', name: 'Vs Computer', sub: 'You vs the robot' },
+    { id: 'two',  emoji: '🧑‍🤝‍🧑', name: '2 Players',  sub: 'Take turns, most points wins' },
+  ],
+  onStart,
+});
+
+function onStart(mode, mount) {
+  const vsAI = (mode === 'ai');
+  const solo = (mode === 'solo');
+  const twoP = (mode === 'two');
+
+  function label(pl) { return solo ? 'You' : vsAI ? (pl === 1 ? 'You' : 'Computer') : ('Player ' + pl); }
+
+  // options
+  let scoring = MM.load('trash-scoring', 'skip5');   // 'one' | 'skip2' | 'skip5' | 'skip10' | 'oddeven'
+  let throwsPer = MM.load('trash-throws', 6);        // throws per player (non-solo) / total (solo)
+  const bestKey = 'trash-best-solo';
+  const best = MM.load(bestKey, null);
+
+  const SCORING = {
+    one:     { name: '1 point', emoji: '1️⃣', step: 1, desc: 'Each make is worth 1 point.' },
+    skip2:   { name: 'Skip by 2', emoji: '2️⃣', step: 2, desc: 'Count by 2s: 2, 4, 6, 8…' },
+    skip5:   { name: 'Skip by 5', emoji: '5️⃣', step: 5, desc: 'Count by 5s: 5, 10, 15…' },
+    skip10:  { name: 'Skip by 10', emoji: '🔟', step: 10, desc: 'Count by 10s: 10, 20, 30…' },
+    oddeven: { name: 'Odds & Evens', emoji: '🔢', step: 0, desc: 'Each ball has a number — add it up!' },
+  };
+
+  const P = { 1: { score: 0, made: 0, thrown: 0 }, 2: { score: 0, made: 0, thrown: 0 } };
+  let turn = 1;
+  let over = false;
+
+  const panel = MM.el('div', { class: 'mm-panel mm-center mm-bounce-in' });
+  mount.appendChild(panel);
+
+  // total throws taken across both players (for turn-based end detection)
+  function everyoneDone() {
+    if (solo) return P[1].thrown >= throwsPer;
+    return P[1].thrown >= throwsPer && P[2].thrown >= throwsPer;
+  }
+
+  /* ---------------- setup screen ---------------- */
+  function setupScreen() {
+    panel.innerHTML = '';
+    MM.status('<span class="chip" style="background:#ff9f1c">Get ready!</span>');
+    panel.appendChild(MM.el('h2', { class: 'mm-center', style: { marginTop: '4px' } }, '🗑️ Trashketball setup'));
+
+    panel.appendChild(MM.el('div', { style: { fontWeight: '800', marginTop: '8px' } }, 'How do you score?'));
+    const sRow = MM.el('div', { class: 'mm-pills', style: { margin: '8px 0 2px' } });
+    Object.keys(SCORING).forEach(k => {
+      sRow.appendChild(MM.el('button', {
+        class: 'mm-pill', 'aria-pressed': String(k === scoring),
+        onClick: () => { MM.sound.play('click'); scoring = k; MM.store('trash-scoring', k); setupScreen(); },
+      }, SCORING[k].emoji + ' ' + SCORING[k].name));
+    });
+    panel.appendChild(sRow);
+    panel.appendChild(MM.el('div', { class: 'mm-hint' }, SCORING[scoring].desc));
+
+    panel.appendChild(MM.el('div', { style: { fontWeight: '800', marginTop: '12px' } },
+      solo ? 'How many throws?' : 'Throws each?'));
+    const tRow = MM.el('div', { class: 'mm-pills', style: { margin: '8px 0 2px' } });
+    [4, 6, 8, 10].forEach(v => {
+      tRow.appendChild(MM.el('button', {
+        class: 'mm-pill', 'aria-pressed': String(v === throwsPer),
+        onClick: () => { MM.sound.play('click'); throwsPer = v; MM.store('trash-throws', v); setupScreen(); },
+      }, '🗑️ ' + v));
+    });
+    panel.appendChild(tRow);
+
+    panel.appendChild(MM.el('div', { class: 'mm-row', style: { marginTop: '14px' } },
+      bigBtn('🏀 Start tossing!', '#2ec4b6', () => { MM.sound.play('pop'); startGame(); })));
+  }
+
+  function startGame() {
+    P[1] = { score: 0, made: 0, thrown: 0 };
+    P[2] = { score: 0, made: 0, thrown: 0 };
+    turn = 1; over = false;
+    playTurn();
+  }
+
+  /* ---------------- a single throw screen ---------------- */
+  function playTurn() {
+    if (over) return;
+    if (everyoneDone()) { finish(); return; }
+    if (vsAI && turn === 2 && P[2].thrown < throwsPer) { aiThrow(); return; }
+
+    const p = P[turn];
+    const throwNum = p.thrown + 1;               // 1-based
+    // odd/even ball number for this throw (labeled ball)
+    const ballNum = scoring === 'oddeven' ? MM.range(1, 10) : null;
+
+    panel.innerHTML = '';
+    panel.appendChild(scorebar());
+    MM.status('<span class="chip" style="background:' + HEX[turn] + '">' + label(turn) +
+      ' — throw ' + throwNum + ' of ' + throwsPer + '</span>');
+
+    // running skip-count strip (visual counting aid)
+    if (SCORING[scoring].step > 0) panel.appendChild(countStrip(turn));
+    else if (scoring === 'oddeven')
+      panel.appendChild(MM.el('div', { style: { fontWeight: '800', fontSize: '18px', margin: '4px 0' } },
+        'Your ball says ' + ballNum + ' (' + (ballNum % 2 ? 'odd' : 'even') + '). Make it to add ' + ballNum + '!'));
+
+    const { w, h, cv, g, geo } = makeCourt();
+    panel.appendChild(cv);
+
+    const resultLine = MM.el('div', { style: { fontWeight: '800', fontSize: '20px', margin: '8px 0 2px', minHeight: '1.4em' } },
+      'Drag the paper to aim, then let go!');
+    panel.appendChild(resultLine);
+
+    // aim state
+    let aiming = false, dragX = 0, dragY = 0;
+    let flying = false, done = false;
+    // ball at launch position
+    let ball = { x: geo.startX, y: geo.startY, r: geo.ballR };
+    let vx = 0, vy = 0, raf = 0, scored = false, settled = 0;
+
+    const label2 = scoring === 'oddeven' ? String(ballNum) : '🗑️';
+
+    function drawStatic() {
+      drawCourt(g, geo, w, h);
+      drawBall(g, ball, label2);
+    }
+
+    function drawAim() {
+      drawCourt(g, geo, w, h);
+      // aim vector from ball toward drag point (sling: launch opposite the drag)
+      const dx = geo.startX - dragX, dy = geo.startY - dragY;
+      const len = Math.min(140, Math.hypot(dx, dy));
+      const ang = Math.atan2(dy, dx);
+      const ex = geo.startX + Math.cos(ang) * len;
+      const ey = geo.startY + Math.sin(ang) * len;
+      // dotted trajectory preview
+      const power = len / 140;
+      previewArc(g, geo.startX, geo.startY, ang, power, geo);
+      // arrow
+      g.strokeStyle = '#ff9f1c'; g.lineWidth = 5; g.setLineDash([]);
+      g.beginPath(); g.moveTo(geo.startX, geo.startY); g.lineTo(ex, ey); g.stroke();
+      // power pip
+      g.fillStyle = power > 0.66 ? '#ff5a5f' : power > 0.33 ? '#ff9f1c' : '#2ec4b6';
+      g.beginPath(); g.arc(ex, ey, 8, 0, 7); g.fill();
+      drawBall(g, ball, label2);
+    }
+
+    function launch(power, ang) {
+      power = Math.max(0.18, Math.min(1, power));
+      const speed = 8 + power * 12;              // gentle range
+      vx = Math.cos(ang) * speed;
+      vy = Math.sin(ang) * speed;
+      flying = true; aiming = false; settled = 0;
+      MM.sound.play('swoosh');
+      raf = requestAnimationFrame(step);
+    }
+
+    function step() {
+      if (!flying) return;
+      vy += 0.55;                                 // gravity
+      ball.x += vx; ball.y += vy;
+      // rim collision / scoring check
+      const rim = geo.rim;                        // {x1,x2,yTop, back}
+      // score when ball passes the hoop plane going down, between the rim posts
+      if (!scored && vy > 0 && ball.y + ball.r >= rim.yTop && ball.y + ball.r <= rim.yTop + 26 &&
+          ball.x > rim.x1 + 6 && ball.x < rim.x2 - 6) {
+        scored = true;
+        // drop it into the can
+        vx *= 0.3;
+      }
+      // gentle wall/floor bounces so it doesn't fly off jarringly
+      if (ball.x - ball.r < 4) { ball.x = 4 + ball.r; vx = -vx * 0.4; }
+      if (ball.x + ball.r > w - 4) { ball.x = w - 4 - ball.r; vx = -vx * 0.4; }
+
+      const floorY = geo.floorY;
+      if (ball.y + ball.r >= floorY) {
+        ball.y = floorY - ball.r; vy = -vy * 0.32; vx *= 0.6;
+        if (Math.abs(vy) < 1.2) { vy = 0; settled++; }
+      }
+      // if scored, let it rest inside the can quickly
+      if (scored && ball.y > rim.yTop + 30) { vx *= 0.7; }
+
+      drawCourt(g, geo, w, h);
+      drawBall(g, ball, label2);
+
+      const restingInCan = scored && ball.y >= geo.canBottomY - ball.r - 2;
+      if (restingInCan) { flying = false; finishThrow(true); return; }
+      if (settled > 3 || ball.y > h + 60) { flying = false; finishThrow(scored); return; }
+      raf = requestAnimationFrame(step);
+    }
+
+    function finishThrow(made) {
+      cancelAnimationFrame(raf);
+      done = true;
+      p.thrown++;
+      const step = SCORING[scoring].step;
+      let gained = 0;
+      if (made) {
+        p.made++;
+        gained = scoring === 'oddeven' ? ballNum : step;
+        p.score += gained;
+        MM.sound.play('ding');
+        MM.confetti({ count: 34, x: w / 2, y: h * 0.4 });
+        resultLine.innerHTML = '🔔 Swish! +' + gained + ' — total <b style="color:' + HEX[turn] + '">' + p.score + '</b>';
+      } else {
+        MM.sound.play('swoosh');
+        resultLine.textContent = '😅 Just missed! Try again.';
+      }
+      // next control
+      const nextRow = MM.el('div', { class: 'mm-row', style: { marginTop: '8px' } });
+      nextRow.appendChild(bigBtn('👉 Next throw', HEX[turn], () => nextThrow()));
+      panel.appendChild(nextRow);
+    }
+
+    function nextThrow() {
+      // decide whose turn next
+      if (everyoneDone()) { finish(); return; }
+      if (solo) { playTurn(); return; }
+      // turn-based: switch player if the current player still has throws OR alternate
+      if (twoP || vsAI) {
+        // alternate every throw so it feels like a match
+        const other = turn === 1 ? 2 : 1;
+        if (P[other].thrown < throwsPer) turn = other;
+        // else stay on current (other is done)
+      }
+      playTurn();
+    }
+
+    // pointer handlers (drag to aim)
+    function pos(e) {
+      const r = cv.getBoundingClientRect();
+      const cx = (e.touches ? e.touches[0].clientX : e.clientX) - r.left;
+      const cy = (e.touches ? e.touches[0].clientY : e.clientY) - r.top;
+      return { x: cx * (w / r.width), y: cy * (h / r.height) };
+    }
+    function down(e) {
+      if (flying || done) return;
+      e.preventDefault();
+      aiming = true;
+      const q = pos(e); dragX = q.x; dragY = q.y; drawAim();
+    }
+    function move(e) {
+      if (!aiming) return;
+      e.preventDefault();
+      const q = pos(e); dragX = q.x; dragY = q.y; drawAim();
+    }
+    function up(e) {
+      if (!aiming) return;
+      e.preventDefault();
+      aiming = false;
+      const dx = geo.startX - dragX, dy = geo.startY - dragY;
+      const len = Math.hypot(dx, dy);
+      if (len < 14) { drawStatic(); return; }     // tiny drag = cancel
+      const ang = Math.atan2(dy, dx);
+      launch(Math.min(140, len) / 140, ang);
+    }
+    cv.addEventListener('pointerdown', down);
+    cv.addEventListener('pointermove', move);
+    cv.addEventListener('pointerup', up);
+    cv.addEventListener('pointercancel', up);
+
+    // also a "Quick Toss" button for kids who don't want to drag: aims at can
+    const help = MM.el('div', { class: 'mm-row', style: { marginTop: '6px' } },
+      bigBtn('🎯 Auto-aim toss', '#ff9f1c', () => {
+        if (flying || done) return;
+        // aim at the can with a little wobble (still fun, ~70% make)
+        const rim = geo.rim;
+        const tx = (rim.x1 + rim.x2) / 2 + MM.range(-14, 14);
+        const ang = Math.atan2((geo.rim.yTop - 90) - geo.startY, tx - geo.startX);
+        launch(0.62 + Math.random() * 0.12, ang);
+      }));
+    panel.appendChild(help);
+    panel.appendChild(MM.el('div', { class: 'mm-hint' }, 'Drag from the paper ball to aim — or use Auto-aim!'));
+
+    drawStatic();
+  }
+
+  /* ---------------- AI throw ---------------- */
+  async function aiThrow() {
+    const p = P[2];
+    const ballNum = scoring === 'oddeven' ? MM.range(1, 10) : null;
+    panel.innerHTML = '';
+    panel.appendChild(scorebar());
+    MM.status('<span class="chip" style="background:' + HEX[2] + '">Computer — throw ' + (p.thrown + 1) + ' of ' + throwsPer + '</span>');
+    if (SCORING[scoring].step > 0) panel.appendChild(countStrip(2));
+
+    const { w, h, cv, g, geo } = makeCourt();
+    panel.appendChild(cv);
+    const line = MM.el('div', { style: { fontWeight: '800', fontSize: '20px', margin: '8px 0', minHeight: '1.4em' } }, 'The robot lines up a toss…');
+    panel.appendChild(line);
+
+    let ball = { x: geo.startX, y: geo.startY, r: geo.ballR };
+    drawCourt(g, geo, w, h); drawBall(g, ball, scoring === 'oddeven' ? String(ballNum) : '🗑️');
+    await MM.sleep(650);
+
+    // robot makes ~68% of throws
+    const willMake = Math.random() < 0.68;
+    const rim = geo.rim;
+    const tx = (rim.x1 + rim.x2) / 2 + (willMake ? MM.range(-8, 8) : MM.range(20, 46) * (Math.random() < 0.5 ? -1 : 1));
+    const ang = Math.atan2((rim.yTop - 92) - geo.startY, tx - geo.startX);
+    const power = 0.62 + Math.random() * 0.1;
+    const speed = 8 + power * 12;
+    let vx = Math.cos(ang) * speed, vy = Math.sin(ang) * speed;
+    let scored = false, settled = 0;
+    MM.sound.play('swoosh');
+
+    await new Promise(res => {
+      function step() {
+        vy += 0.55; ball.x += vx; ball.y += vy;
+        if (!scored && vy > 0 && ball.y + ball.r >= rim.yTop && ball.y + ball.r <= rim.yTop + 26 &&
+            ball.x > rim.x1 + 6 && ball.x < rim.x2 - 6) { scored = true; vx *= 0.3; }
+        if (ball.x - ball.r < 4) { ball.x = 4 + ball.r; vx = -vx * 0.4; }
+        if (ball.x + ball.r > w - 4) { ball.x = w - 4 - ball.r; vx = -vx * 0.4; }
+        if (ball.y + ball.r >= geo.floorY) { ball.y = geo.floorY - ball.r; vy = -vy * 0.32; vx *= 0.6; if (Math.abs(vy) < 1.2) { vy = 0; settled++; } }
+        drawCourt(g, geo, w, h); drawBall(g, ball, scoring === 'oddeven' ? String(ballNum) : '🗑️');
+        const restingInCan = scored && ball.y >= geo.canBottomY - ball.r - 2;
+        if (restingInCan || settled > 3 || ball.y > h + 60) { res(scored); return; }
+        requestAnimationFrame(step);
+      }
+      requestAnimationFrame(step);
+    }).then(made => {
+      p.thrown++;
+      if (made) {
+        p.made++;
+        const gained = scoring === 'oddeven' ? ballNum : SCORING[scoring].step;
+        p.score += gained;
+        MM.sound.play('ding'); MM.confetti({ count: 26, x: w / 2, y: h * 0.4 });
+        line.innerHTML = '🔔 The robot swishes it! +' + gained + ' — total <b style="color:' + HEX[2] + '">' + p.score + '</b>';
+      } else { MM.sound.play('swoosh'); line.textContent = '😅 The robot missed!'; }
+    });
+
+    await MM.sleep(950);
+    if (everyoneDone()) { finish(); return; }
+    turn = P[1].thrown < throwsPer ? 1 : 2;
+    playTurn();
+  }
+
+  /* ---------------- court / drawing ---------------- */
+  function makeCourt() {
+    const w = Math.max(300, Math.min(560, window.innerWidth - 40));
+    const h = Math.round(w * 0.78);
+    const cv = MM.el('canvas', { width: w, height: h, style: { width: w + 'px', maxWidth: '100%', height: 'auto', touchAction: 'none', borderRadius: '18px', background: 'linear-gradient(#eaf4ff,#fdf6ff)' } });
+    const g = cv.getContext('2d');
+    const floorY = h - 26;
+    // trash can on the right
+    const canW = Math.max(70, w * 0.2), canH = Math.max(78, h * 0.26);
+    const canX = w - canW - 16;
+    const canTopY = floorY - canH;
+    const geo = {
+      floorY, ballR: Math.max(16, w * 0.05),
+      startX: Math.max(46, w * 0.13), startY: floorY - Math.max(30, w * 0.09),
+      can: { x: canX, y: canTopY, w: canW, h: canH },
+      canBottomY: floorY - 8,
+      rim: { x1: canX + 4, x2: canX + canW - 4, yTop: canTopY },
+    };
+    return { w, h, cv, g, geo };
+  }
+
+  function drawCourt(g, geo, w, h) {
+    g.clearRect(0, 0, w, h);
+    // floor
+    g.fillStyle = '#d9c7a8'; g.fillRect(0, geo.floorY, w, h - geo.floorY);
+    g.strokeStyle = '#c3ac86'; g.lineWidth = 2; g.beginPath(); g.moveTo(0, geo.floorY); g.lineTo(w, geo.floorY); g.stroke();
+    // thrower marker
+    g.font = Math.floor(geo.ballR * 1.4) + 'px serif'; g.textAlign = 'center'; g.textBaseline = 'alphabetic';
+    g.fillText('🧒', geo.startX, geo.floorY - 2);
+    // trash can (behind rim so ball drops "in")
+    const c = geo.can;
+    g.fillStyle = '#7bd3c9';
+    roundRect(g, c.x, c.y + 6, c.w, c.h - 6, 8); g.fill();
+    // vertical ridges
+    g.strokeStyle = '#5bb8ad'; g.lineWidth = 3;
+    for (let i = 1; i < 4; i++) { const x = c.x + (c.w * i) / 4; g.beginPath(); g.moveTo(x, c.y + 12); g.lineTo(x, c.y + c.h - 6); g.stroke(); }
+    // rim (opening)
+    g.fillStyle = '#3fae9f';
+    roundRect(g, c.x - 4, c.y, c.w + 8, 14, 7); g.fill();
+    g.fillStyle = '#2c7d72';
+    g.beginPath(); g.ellipse(c.x + c.w / 2, c.y + 6, c.w / 2 - 2, 6, 0, 0, 7); g.fill();
+    // label
+    g.font = '800 14px system-ui, sans-serif'; g.fillStyle = '#ffffff';
+    g.fillText('🗑️', c.x + c.w / 2, c.y + c.h * 0.7);
+  }
+
+  function drawBall(g, ball, labelTxt) {
+    g.save();
+    g.beginPath(); g.arc(ball.x, ball.y, ball.r, 0, 7);
+    const grd = g.createRadialGradient(ball.x - ball.r * 0.3, ball.y - ball.r * 0.3, ball.r * 0.2, ball.x, ball.y, ball.r);
+    grd.addColorStop(0, '#ffffff'); grd.addColorStop(1, '#dcd7c8');
+    g.fillStyle = grd; g.fill();
+    g.lineWidth = 2; g.strokeStyle = '#b7b09a'; g.stroke();
+    // crumple lines
+    g.strokeStyle = '#c9c3ad'; g.lineWidth = 1.5;
+    g.beginPath(); g.moveTo(ball.x - ball.r * 0.5, ball.y); g.lineTo(ball.x + ball.r * 0.4, ball.y - ball.r * 0.3); g.stroke();
+    g.beginPath(); g.moveTo(ball.x - ball.r * 0.2, ball.y + ball.r * 0.4); g.lineTo(ball.x + ball.r * 0.5, ball.y + ball.r * 0.1); g.stroke();
+    if (labelTxt && labelTxt !== '🗑️') {
+      g.fillStyle = '#2b2440'; g.font = '800 ' + Math.floor(ball.r * 0.9) + 'px system-ui, sans-serif';
+      g.textAlign = 'center'; g.textBaseline = 'middle'; g.fillText(labelTxt, ball.x, ball.y);
+    }
+    g.restore();
+  }
+
+  function previewArc(g, x, y, ang, power, geo) {
+    power = Math.max(0.18, Math.min(1, power));
+    const speed = 8 + power * 12;
+    let px = x, py = y, pvx = Math.cos(ang) * speed, pvy = Math.sin(ang) * speed;
+    g.fillStyle = 'rgba(58,134,255,.5)';
+    for (let i = 0; i < 40; i++) {
+      pvy += 0.55; px += pvx; py += pvy;
+      if (py > geo.floorY || px > geo.can.x) break;
+      if (i % 2 === 0) { g.beginPath(); g.arc(px, py, 3, 0, 7); g.fill(); }
+    }
+  }
+
+  /* ---------------- score / count widgets ---------------- */
+  function scorebar() {
+    if (solo) {
+      return MM.el('div', { class: 'mm-scorebar' },
+        MM.el('div', { class: 'mm-score' }, MM.el('span', { class: 'dot', style: { background: HEX[1] } }),
+          MM.el('span', {}, 'Points: ' + P[1].score)),
+        MM.el('div', { class: 'mm-score' }, '🎯 Made: ' + P[1].made + '/' + throwsPer),
+        best != null ? MM.el('div', { class: 'mm-score' }, '⭐ Best: ' + best) : null,
+      );
+    }
+    return MM.el('div', { class: 'mm-scorebar' },
+      [1, 2].map(pl => MM.el('div', { class: 'mm-score' + (pl === turn && !over ? ' active' : '') },
+        MM.el('span', { class: 'dot', style: { background: HEX[pl] } }),
+        MM.el('span', {}, label(pl) + ': ' + P[pl].score))));
+  }
+
+  // horizontal strip that shows the skip-count so far, highlighting each make
+  function countStrip(pl) {
+    const step = SCORING[scoring].step;
+    const made = P[pl].made;
+    const wrap = MM.el('div', { style: { display: 'flex', gap: '6px', flexWrap: 'wrap', justifyContent: 'center', margin: '4px 0 6px' } });
+    const showN = Math.max(made + 1, 6);
+    for (let i = 1; i <= showN; i++) {
+      const val = step * i;
+      const lit = i <= made;
+      wrap.appendChild(MM.el('div', {
+        style: {
+          minWidth: '38px', padding: '5px 8px', borderRadius: '10px', fontWeight: '800', fontSize: '16px',
+          background: lit ? HEX[pl] : '#fff', color: lit ? '#fff' : '#b9b0cf',
+          boxShadow: lit ? '0 3px 0 rgba(0,0,0,.12)' : 'inset 0 0 0 2px #efe9f7',
+        },
+      }, String(val)));
+    }
+    return wrap;
+  }
+
+  /* ---------------- finish ---------------- */
+  function finish() {
+    over = true;
+    if (solo) {
+      const sc = P[1].score;
+      let sub = 'You made ' + P[1].made + ' of ' + throwsPer + ' for ' + sc + ' points!';
+      if (best == null || sc > best) { MM.store(bestKey, sc); sub += ' 🌟 New best!'; }
+      else sub += ' (Best: ' + best + ')';
+      MM.win({ title: 'Nice tossing! 🎉', emoji: '🏆', sub, onAgain: () => setupScreen() });
+      return;
+    }
+    const s1 = P[1].score, s2 = P[2].score;
+    if (s1 === s2) {
+      MM.win({ title: "It's a tie! 🤝", emoji: '🤝', sub: 'Both scored ' + s1 + ' points!', onAgain: () => setupScreen() });
+      return;
+    }
+    const winner = s1 > s2 ? 1 : 2;
+    if (vsAI) {
+      const youWin = winner === 1;
+      MM.win({ lose: !youWin, title: youWin ? 'You win! 🎉' : 'Computer wins!',
+        emoji: youWin ? '🏆' : '🤖',
+        sub: 'You ' + s1 + ' — ' + s2 + ' Computer', onAgain: () => setupScreen() });
+      return;
+    }
+    MM.win({ title: label(winner) + ' wins! 🎉', emoji: winner === 1 ? '🔵' : '🔴',
+      sub: 'Player 1 ' + s1 + ' — ' + s2 + ' Player 2', onAgain: () => setupScreen() });
+  }
+
+  /* ---------------- helpers ---------------- */
+  function bigBtn(text, bg, onClick) {
+    return MM.el('button', {
+      class: 'mm-btn', style: { fontSize: '19px', padding: '13px 24px', minHeight: '54px', background: bg },
+      onClick: () => onClick(),
+    }, text);
+  }
+  function roundRect(g, x, y, w, h, r) {
+    g.beginPath();
+    g.moveTo(x + r, y);
+    g.arcTo(x + w, y, x + w, y + h, r);
+    g.arcTo(x + w, y + h, x, y + h, r);
+    g.arcTo(x, y + h, x, y, r);
+    g.arcTo(x, y, x + w, y, r);
+    g.closePath();
+  }
+
+  setupScreen();
+}
+</script>
+</body>
+</html>

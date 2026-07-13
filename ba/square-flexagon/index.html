@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Flexagon</title>
+<link rel="stylesheet" href="../../assets/common.css">
+</head>
+<body>
+<script src="../../assets/common.js"></script>
+<script>
+/* FLEXAGON — a folded-paper toy that "flexes" to reveal hidden faces.
+   We fake the paper fold with a CSS 3D flip. Two flex directions
+   (horizontal / vertical) walk through a 6-face cycle so a kid discovers
+   more faces than a flat square "should" have. */
+
+// The 6 hidden faces. Each is a bright color + number + a fun emoji face.
+const FACES = [
+  { n: 1, color: '#3a86ff', emoji: '😀' },
+  { n: 2, color: '#ff5a5f', emoji: '😎' },
+  { n: 3, color: '#2ec4b6', emoji: '🤩' },
+  { n: 4, color: '#ffd23f', emoji: '😜' },
+  { n: 5, color: '#8338ec', emoji: '🥳' },
+  { n: 6, color: '#ff9f1c', emoji: '😻' },
+];
+
+MM.game({
+  title: 'Flexagon', emoji: '🎭',
+  ba: 'https://beastacademy.com/playground/square-flexagon',
+  rules: `
+    <p><b>A flexagon is folding-paper magic!</b> 🪄 You take a strip of paper and
+    fold it in a clever way. It looks like a plain square with a front and a back…</p>
+    <p>…but when you <b>flex</b> it (bend and open it up a new way) a <b>hidden face</b>
+    pops out that was tucked inside! Keep flexing and even more hidden faces appear.</p>
+    <ol>
+      <li>Tap <b>🔄 Flex this way</b> or <b>🔃 Flex that way</b> — just like a real
+        flexagon has two ways to bend.</li>
+      <li>Each flex opens the paper to a <b>new number and color face</b>.</li>
+      <li>Try to discover <b>all 6 hidden faces!</b> 🎉</li>
+    </ol>
+    <p>A flat square seems to have only 2 sides — but folding hides extra faces you
+    can flex out. Sneaky paper!</p>`,
+  // Single activity — no modes. Goes straight to onStart(null, mount).
+  onStart,
+});
+
+function onStart(mode, mount) {
+  const size = Math.min(320, window.innerWidth - 70);
+
+  // A tiny "state machine": from each face, the two flex directions lead
+  // to a different next face, so the two buttons feel meaningfully different.
+  // (Cyclic tours over the 6 faces.)
+  const NEXT = {  // "this way" (horizontal flex): step +1 around the ring
+    dir1: i => (i + 1) % FACES.length,
+    dir2: i => (i + 2) % FACES.length, // "that way" (vertical flex): step +2
+  };
+
+  let cur = 0;                 // index into FACES currently showing
+  let flipping = false;
+  const found = new Set([0]);  // faces discovered so far
+  let best = MM.load('flexagon-best', 0);
+
+  // ---- build the paper square (a CSS 3D flip card) ----
+  const paper = MM.el('div', { class: 'flx-paper' });
+  const faceFront = MM.el('div', { class: 'flx-face' });
+  const faceBack  = MM.el('div', { class: 'flx-face flx-back' });
+  paper.append(faceFront, faceBack);
+
+  const scene = MM.el('div', { class: 'flx-scene' }, paper);
+
+  // draw one face's four quadrants into a face element
+  function paintFace(el, idx) {
+    const f = FACES[idx];
+    el.innerHTML = '';
+    el.style.background = f.color;
+    // 4 quadrants, each a slightly different shade + the big number/emoji
+    const q = MM.el('div', { class: 'flx-quads' });
+    for (let k = 0; k < 4; k++) {
+      const shade = k % 2 === 0 ? 'rgba(255,255,255,.16)' : 'rgba(0,0,0,.10)';
+      q.appendChild(MM.el('div', { class: 'flx-quad', style: { background: shade } },
+        MM.el('span', { class: 'flx-qemoji' }, f.emoji)));
+    }
+    el.appendChild(q);
+    el.appendChild(MM.el('div', { class: 'flx-big' }, String(f.n)));
+  }
+  paintFace(faceFront, cur);
+
+  // ---- controls ----
+  const b1 = MM.el('button', { class: 'mm-btn blue flx-flexbtn', onClick: () => flex('dir1') },
+    '🔄 Flex this way');
+  const b2 = MM.el('button', { class: 'mm-btn purple flx-flexbtn', onClick: () => flex('dir2') },
+    '🔃 Flex that way');
+  const btnRow = MM.el('div', { class: 'mm-row', style: { marginTop: '18px' } }, b1, b2);
+
+  const counter = MM.el('div', { class: 'flx-counter' });
+
+  const panel = MM.el('div', { class: 'mm-panel mm-center mm-bounce-in' },
+    MM.el('div', { class: 'mm-hint', style: { marginTop: 0 } },
+      'Flex the folded paper to reveal hidden faces!'),
+    scene, btnRow, counter);
+  mount.appendChild(panel);
+
+  updateCounter();
+  updateStatus();
+
+  function updateStatus() {
+    MM.status(`Showing face <b style="color:${FACES[cur].color}">#${FACES[cur].n}</b> ${FACES[cur].emoji}`);
+  }
+
+  function updateCounter() {
+    const dots = FACES.map((f, i) =>
+      `<span class="flx-dot" style="background:${found.has(i) ? f.color : '#e3ddef'}">${found.has(i) ? '✓' : '?'}</span>`
+    ).join('');
+    counter.innerHTML =
+      `<div class="flx-count-num">You found <b>${found.size}</b> of <b>${FACES.length}</b> hidden faces!</div>` +
+      `<div class="flx-dots">${dots}</div>` +
+      (best ? `<div class="flx-best">Best ever: ${best} 🌟</div>` : '');
+  }
+
+  function setButtons(disabled) {
+    b1.disabled = disabled; b2.disabled = disabled;
+  }
+
+  async function flex(dir) {
+    if (flipping) return;
+    flipping = true;
+    setButtons(true);
+    MM.sound.play('swoosh');
+
+    const nextIdx = NEXT[dir](cur);
+    // paint the hidden (back) face BEFORE we flip so it "opens" to the new face
+    paintFace(faceBack, nextIdx);
+
+    // choose flip axis by direction: this-way = flip around Y, that-way = X
+    paper.classList.remove('flx-flip-y', 'flx-flip-x');
+    // force reflow so re-adding the class always re-triggers the animation
+    void paper.offsetWidth;
+    paper.classList.add(dir === 'dir1' ? 'flx-flip-y' : 'flx-flip-x');
+
+    await MM.sleep(560);
+
+    // after the flip, the back is now the front visually — copy it onto the
+    // real front and reset the card so we can flip again next time.
+    cur = nextIdx;
+    paintFace(faceFront, cur);
+    paper.classList.remove('flx-flip-y', 'flx-flip-x');
+    MM.sound.play('pop');
+
+    const isNew = !found.has(cur);
+    if (isNew) {
+      found.add(cur);
+      MM.sound.play('ding');
+      const r = paper.getBoundingClientRect();
+      MM.confetti({ count: 40, x: r.left + r.width / 2, y: r.top + r.height / 2 });
+    }
+    updateCounter();
+    updateStatus();
+
+    if (found.size > best) { best = found.size; MM.store('flexagon-best', best); }
+
+    if (found.size === FACES.length) {
+      setTimeout(() => {
+        MM.win({
+          title: 'All faces found! 🎉',
+          emoji: '🎭',
+          sub: 'You flexed out every one of the ' + FACES.length + ' hidden faces!',
+          onAgain: () => { found.clear(); found.add(cur); updateCounter(); updateStatus(); },
+        });
+      }, 260);
+    }
+
+    flipping = false;
+    setButtons(false);
+  }
+}
+</script>
+<style>
+  .flx-scene {
+    display: flex; justify-content: center; align-items: center;
+    perspective: 900px; margin: 10px auto 4px;
+    min-height: 300px;
+  }
+  .flx-paper {
+    position: relative;
+    width: 300px; height: 300px; max-width: 78vw; max-height: 78vw;
+    transform-style: preserve-3d;
+    transition: transform .56s cubic-bezier(.5,.05,.3,1);
+    transform: rotateY(0deg);
+    will-change: transform;
+  }
+  .flx-flip-y { transform: rotateY(180deg); }
+  .flx-flip-x { transform: rotateX(180deg); }
+  .flx-face {
+    position: absolute; inset: 0;
+    border-radius: 22px;
+    box-shadow: 0 12px 30px rgba(34,34,59,.28);
+    border: 6px solid #fff;
+    overflow: hidden;
+    backface-visibility: hidden;
+    -webkit-backface-visibility: hidden;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .flx-back { transform: rotateY(180deg); }
+  /* when flipping on X axis the back needs to be pre-rotated on X */
+  .flx-flip-x .flx-back { transform: rotateX(180deg); }
+  .flx-quads {
+    position: absolute; inset: 0;
+    display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr;
+  }
+  .flx-quad { display: flex; align-items: center; justify-content: center; }
+  .flx-qemoji { font-size: clamp(30px, 9vw, 52px); opacity: .85; }
+  .flx-big {
+    position: relative; z-index: 2;
+    font-size: clamp(90px, 30vw, 150px); font-weight: 900; color: #fff;
+    text-shadow: 0 4px 0 rgba(0,0,0,.22);
+    line-height: 1;
+  }
+  .flx-flexbtn { font-size: 18px; padding: 14px 22px; min-height: 52px; }
+  .flx-counter { margin-top: 18px; }
+  .flx-count-num { font-size: 20px; font-weight: 800; }
+  .flx-dots { display: flex; gap: 8px; justify-content: center; margin-top: 10px; flex-wrap: wrap; }
+  .flx-dot {
+    width: 40px; height: 40px; border-radius: 12px;
+    display: inline-flex; align-items: center; justify-content: center;
+    color: #fff; font-weight: 900; font-size: 20px;
+    box-shadow: 0 3px 0 rgba(0,0,0,.12);
+  }
+  .flx-best { margin-top: 10px; color: var(--ink-soft); font-weight: 800; }
+</style>
+</body>
+</html>

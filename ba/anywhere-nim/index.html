@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Anywhere Nim</title>
+<link rel="stylesheet" href="../../assets/common.css">
+</head>
+<body>
+<script src="../../assets/common.js"></script>
+<script>
+/* ANYWHERE NIM — count up from 1, taking turns. On your turn say 1 or 2
+   consecutive numbers. Whoever says the TARGET number wins.
+   This is subtraction Nim (subtract 1 or 2 from remaining). To win, after
+   your move you want the running count c to satisfy (T - c) % 3 === 0 — i.e.
+   leave the opponent on a multiple-of-3 gap. If you can't, you're losing;
+   play randomly. In Vs Computer the HUMAN goes first so the trick is learnable. */
+
+MM.game({
+  title: 'Anywhere Nim', emoji: '🔢',
+  ba: 'https://beastacademy.com/playground/anywhere-nim',
+  rules: `
+    <p><b>Count up to win!</b> Together you count out loud starting at <b>1</b>, taking turns.</p>
+    <ol>
+      <li>On your turn, say <b>1 or 2</b> numbers in a row.</li>
+      <li>The next player keeps counting from where you stopped.</li>
+      <li>Whoever says the <b>target number</b> (10 or 21) <b>WINS!</b> 🏆</li>
+    </ol>
+    <p><b>Secret trick:</b> try to be the one who says 3, 6, 9… (the numbers just before each group of three). Can you figure out the winning pattern?</p>`,
+  modes: [
+    { id: 'ai',   emoji: '🤖', name: 'Vs Computer', sub: 'You go first!' },
+    { id: 'two',  emoji: '🧑‍🤝‍🧑', name: '2 Players', sub: 'Pass & play' },
+    { id: 'solo', emoji: '🧠', name: 'Solo Practice', sub: 'Beat the robot' },
+  ],
+  onStart,
+});
+
+const HEX = { 1: '#3a86ff', 2: '#ff5a5f' };
+
+function onStart(mode, mount) {
+  const vsAI = (mode === 'ai' || mode === 'solo');
+  const AI = 2;                 // computer is player 2; human (player 1) goes first
+  let target = MM.load('anim-target', 10);
+
+  let count = 0;                // last number said (0 = nobody has counted yet)
+  let turn = 1;                 // whose turn it is to speak
+  let over = false;
+  let busy = false;
+
+  // ---- layout ----
+  const panel = MM.el('div', { class: 'mm-panel mm-center mm-bounce-in' });
+
+  // target picker pill row
+  const pillRow = MM.el('div', { class: 'mm-pills', style: { marginBottom: '14px' } });
+  function buildPills() {
+    pillRow.innerHTML = '';
+    pillRow.appendChild(MM.el('span', { style: { fontWeight: '800', alignSelf: 'center', marginRight: '4px' } }, 'Target:'));
+    [10, 21].forEach(t => {
+      pillRow.appendChild(MM.el('button', {
+        class: 'mm-pill', 'aria-pressed': String(t === target),
+        onClick: () => { if (busy) return; MM.sound.play('click'); target = t; MM.store('anim-target', t); reset(); },
+      }, '🎯 ' + t));
+    });
+  }
+
+  // big number display
+  const bigNum = MM.el('div', {
+    style: {
+      fontSize: 'clamp(72px, 24vw, 150px)', fontWeight: '900', lineHeight: '1',
+      margin: '10px 0', color: '#22223b', transition: 'transform .12s ease',
+    },
+  }, '–');
+
+  const goalLine = MM.el('div', { style: { fontSize: 'clamp(18px,4vw,24px)', fontWeight: '800', color: 'var(--ink-soft)' } });
+
+  // "ribbon" of numbers said so far
+  const ribbon = MM.el('div', {
+    style: {
+      display: 'flex', flexWrap: 'wrap', gap: '8px', justifyContent: 'center',
+      margin: '16px 0', minHeight: '46px', maxWidth: '560px', marginLeft: 'auto', marginRight: 'auto',
+    },
+  });
+
+  // action buttons
+  const btn1 = MM.el('button', { class: 'mm-btn green', style: { fontSize: '20px', padding: '16px 26px', minHeight: '56px' } });
+  const btn2 = MM.el('button', { class: 'mm-btn purple', style: { fontSize: '20px', padding: '16px 26px', minHeight: '56px' } });
+  const btnRow = MM.el('div', { class: 'mm-row', style: { marginTop: '10px' } }, btn1, btn2);
+
+  const hint = MM.el('div', { class: 'mm-hint' });
+
+  panel.append(pillRow, goalLine, bigNum, ribbon, btnRow, hint);
+  mount.appendChild(panel);
+
+  function label(pl) {
+    if (!vsAI) return 'Player ' + pl;
+    return pl === AI ? 'Computer' : 'You';
+  }
+
+  function statusUpdate() {
+    if (over) return;
+    const who = vsAI ? (turn === AI ? 'Computer…' : 'Your turn') : ('Player ' + turn + "'s turn");
+    MM.status(`<span class="chip" style="background:${HEX[turn]}">${who}</span>`);
+  }
+
+  function chip(n, pl) {
+    return MM.el('div', {
+      style: {
+        background: HEX[pl], color: '#fff', fontWeight: '900',
+        borderRadius: '12px', padding: '6px 12px', fontSize: '20px',
+        boxShadow: '0 4px 0 rgba(0,0,0,.14)',
+      },
+    }, String(n));
+  }
+
+  function renderStatic() {
+    goalLine.textContent = 'Say ' + target + ' to WIN! 🏆';
+    bigNum.textContent = count === 0 ? '–' : String(count);
+    updateButtons();
+    statusUpdate();
+  }
+
+  function updateButtons() {
+    const remaining = target - count;
+    // you may say 1 number always (unless game over); 2 numbers only if it doesn't overshoot target
+    const canTwo = remaining >= 2 && !over;
+    const canOne = remaining >= 1 && !over;
+    const active = !over && !busy && (!vsAI || turn !== AI);
+
+    btn1.disabled = !(active && canOne);
+    btn2.disabled = !(active && canTwo);
+
+    btn1.innerHTML = canOne
+      ? '🗣️ Say <b>' + (count + 1) + '</b>'
+      : '🗣️ Say 1';
+    btn2.innerHTML = canTwo
+      ? '🗣️🗣️ Say <b>' + (count + 1) + '</b> &amp; <b>' + (count + 2) + '</b>'
+      : '🗣️🗣️ Say 2';
+
+    if (over) hint.textContent = '';
+    else if (vsAI && turn === AI) hint.textContent = 'The computer is thinking…';
+    else hint.textContent = 'Tap how many numbers to say. Reach ' + target + ' to win!';
+  }
+
+  // Perform a move: say `n` numbers (1 or 2)
+  async function say(n, pl) {
+    if (over) return;
+    for (let k = 0; k < n; k++) {
+      count++;
+      bigNum.textContent = String(count);
+      bigNum.style.transform = 'scale(1.25)';
+      ribbon.appendChild(chip(count, pl));
+      MM.sound.play(k === 0 ? 'place' : 'pop');
+      await MM.sleep(180);
+      bigNum.style.transform = 'scale(1)';
+      if (count === target) { finish(pl); return; }
+      if (k < n - 1) await MM.sleep(120);
+    }
+    // pass turn
+    turn = turn === 1 ? 2 : 1;
+    renderStatic();
+    if (vsAI && turn === AI && !over) { busy = true; updateButtons(); setTimeout(aiTurn, 650); }
+  }
+
+  async function humanSay(n) {
+    if (over || busy) return;
+    if (vsAI && turn === AI) return;
+    if (target - count < n) return;
+    busy = true; updateButtons();
+    await say(n, turn);
+    busy = false; updateButtons();
+  }
+
+  // ---- Perfect AI ----
+  // remaining = target - count. Winning move: leave remaining ≡ 0 (mod 3) for opponent,
+  // i.e. take r = remaining % 3 (if r is 1 or 2). If r === 0 we're losing → random legal.
+  async function aiTurn() {
+    if (over) return;
+    const remaining = target - count;
+    let n;
+    const r = remaining % 3;
+    if (r === 1 || r === 2) n = r;            // perfect: move to a multiple of 3 gap (or take the win)
+    else n = MM.choice([1, 2].filter(x => x <= remaining)); // losing position — play on, stay legal
+    if (n > remaining) n = remaining;
+    await say(n, AI);
+    busy = false; updateButtons();
+  }
+
+  function finish(winnerPl) {
+    over = true;
+    updateButtons();
+    if (vsAI) {
+      const youWin = winnerPl !== AI;
+      MM.win({
+        lose: !youWin,
+        title: youWin ? 'You reached ' + target + '! 🎉' : 'Computer got ' + target + '!',
+        emoji: youWin ? '🏆' : '🤖',
+        sub: youWin ? 'You cracked the counting trick!' : 'Try saying 3, 6, 9… next time!',
+        onAgain: () => MM.toMenu(),
+      });
+    } else {
+      MM.win({
+        title: label(winnerPl) + ' wins! 🎉',
+        emoji: winnerPl === 1 ? '🔵' : '🔴',
+        sub: 'Reached ' + target + ' first!',
+        onAgain: () => MM.toMenu(),
+      });
+    }
+  }
+
+  function reset() {
+    over = false; busy = false; count = 0; turn = 1;
+    ribbon.innerHTML = '';
+    buildPills();
+    renderStatic();
+    // Human always goes first in vsAI, so no AI auto-move at start.
+  }
+
+  btn1.addEventListener('click', () => humanSay(1));
+  btn2.addEventListener('click', () => humanSay(2));
+
+  reset();
+}
+</script>
+</body>
+</html>

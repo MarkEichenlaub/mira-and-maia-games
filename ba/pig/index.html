@@ -1,0 +1,331 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Pig</title>
+<link rel="stylesheet" href="../../assets/common.css">
+</head>
+<body>
+<script src="../../assets/common.js"></script>
+<script>
+/* PIG — push-your-luck dice.
+   Roll to build a TURN total. Roll a 1 and you lose the whole turn. HOLD to bank.
+   First to the target wins.  AI uses the classic "hold at 20, adjusted for score gap". */
+
+const BLUE = '#3a86ff', RED = '#ff5a5f', GREEN = '#2ec4b6', YELLOW = '#ffd23f';
+
+MM.game({
+  title: 'Pig', emoji: '🐷',
+  ba: 'https://beastacademy.com/playground/pig',
+  rules: `
+    <p><b>Push your luck!</b> On your turn you can roll the die as many times as you dare.</p>
+    <ol>
+      <li>Roll a <b>2–6</b> and it gets added to your <b>turn total</b> (that's your points "at risk").</li>
+      <li>Roll a <b>1</b> 😱 and you lose the whole turn total — your turn ends with nothing!</li>
+      <li>Tap <b>HOLD ✋</b> to bank your turn total safely into your score.</li>
+      <li>First one to reach the <b>target</b> wins! 🏆</li>
+    </ol>
+    <p>Tip: greedy pigs who never hold usually roll a 1 and lose it all. Bank early, bank often!</p>`,
+  modes: [
+    { id: 'ai',   emoji: '🤖', name: 'Vs Computer', sub: 'You are the blue pig' },
+    { id: 'two',  emoji: '🧑‍🤝‍🧑', name: '2 Players', sub: 'Pass & play' },
+    { id: 'solo', emoji: '⭐', name: 'Solo Challenge', sub: 'Fewest turns to win' },
+  ],
+  onStart,
+});
+
+function onStart(mode, mount) {
+  const vsAI = mode === 'ai';
+  const solo = mode === 'solo';
+  const AI = 2;
+
+  let target = MM.load('pig-target', 50);
+
+  // player state
+  let score = [0, 0, 0];   // index 1 & 2 used
+  let turn = 1;
+  let turnTotal = 0;
+  let over = false;
+  let busy = false;
+  let turnsTaken = 0;      // solo: count of turns used
+
+  const best = MM.load('pig-best-turns', null);
+
+  // ---------- layout ----------
+  const panel = MM.el('div', { class: 'mm-panel mm-center mm-bounce-in' });
+
+  // target pill row (only meaningful before first roll / on reset)
+  const pillRow = MM.el('div', { class: 'mm-pills', style: { marginBottom: '12px' } });
+  function buildPills() {
+    pillRow.innerHTML = '';
+    pillRow.appendChild(MM.el('span', { style: { fontWeight: '800', alignSelf: 'center', marginRight: '4px' } }, 'Race to:'));
+    [50, 100].forEach(t => {
+      pillRow.appendChild(MM.el('button', {
+        class: 'mm-pill', 'aria-pressed': String(t === target),
+        onClick: () => { if (busy || started) return; MM.sound.play('click'); target = t; MM.store('pig-target', t); reset(); },
+      }, '🎯 ' + t));
+    });
+  }
+  let started = false;   // true once any roll happens (locks the target)
+
+  // scoreboard
+  const scorebar = MM.el('div', { class: 'mm-scorebar' });
+  function nameOf(p) {
+    if (solo) return 'You';
+    if (vsAI) return p === 1 ? 'You' : 'Computer';
+    return 'Player ' + p;
+  }
+  function pigEmoji(p) { return p === 1 ? '🐷' : '🐖'; }
+  function buildScorebar() {
+    scorebar.innerHTML = '';
+    const players = solo ? [1] : [1, 2];
+    players.forEach(p => {
+      const active = p === turn && !over;
+      const card = MM.el('div', { class: 'mm-score' + (active ? ' active' : '') },
+        MM.el('span', {}, pigEmoji(p)),
+        MM.el('span', {}, nameOf(p) + ':'),
+        MM.el('span', { style: { color: p === 1 ? BLUE : RED } }, String(score[p]))
+      );
+      scorebar.appendChild(card);
+    });
+    if (solo) {
+      scorebar.appendChild(MM.el('div', { class: 'mm-score' },
+        MM.el('span', {}, '🎯'), MM.el('span', {}, String(target))));
+      scorebar.appendChild(MM.el('div', { class: 'mm-score' },
+        MM.el('span', {}, '🔁'), MM.el('span', {}, 'Turn ' + (turnsTaken + 1))));
+    }
+  }
+
+  // big die
+  const dieWrap = MM.el('div', {
+    style: { display: 'flex', justifyContent: 'center', margin: '10px 0 6px', minHeight: '96px', alignItems: 'center', transform: 'scale(1.25)' },
+  });
+  const dieEl = MM.el('div', { class: 'mm-die' });
+  { const d = MM.die(1); dieEl.replaceChildren(...d.childNodes); }
+  dieWrap.appendChild(dieEl);
+
+  // "at risk" meter
+  const riskEl = MM.el('div', {
+    style: {
+      fontSize: 'clamp(20px,5vw,30px)', fontWeight: '900', margin: '4px 0 2px',
+      color: 'var(--c-orange)', transition: 'transform .12s ease',
+    },
+  });
+  const riskSub = MM.el('div', { class: 'mm-hint', style: { marginTop: '0' } }, 'points at risk this turn');
+
+  // buttons
+  const rollBtn = MM.el('button', {
+    class: 'mm-btn green', style: { fontSize: '22px', padding: '16px 30px', minWidth: '150px' },
+    onClick: onRoll,
+  }, '🎲 ROLL');
+  const holdBtn = MM.el('button', {
+    class: 'mm-btn orange', style: { fontSize: '22px', padding: '16px 30px', minWidth: '150px' },
+    onClick: onHold,
+  }, '✋ HOLD');
+  const btnRow = MM.el('div', { class: 'mm-row', style: { marginTop: '14px' } }, rollBtn, holdBtn);
+
+  panel.append(pillRow, scorebar, dieWrap, riskEl, riskSub, btnRow);
+  mount.appendChild(panel);
+
+  buildPills();
+  reset();
+
+  // ---------- flow ----------
+  function reset() {
+    score = [0, 0, 0];
+    turn = 1;
+    turnTotal = 0;
+    over = false;
+    busy = false;
+    started = false;
+    turnsTaken = 0;
+    buildPills();
+    refresh();
+    statusUpdate();
+    updateButtons();
+  }
+
+  function refresh() {
+    buildScorebar();
+    riskEl.textContent = '🔥 ' + turnTotal;
+    riskEl.style.color = turnTotal === 0 ? 'var(--ink-soft)' : 'var(--c-orange)';
+  }
+
+  function statusUpdate() {
+    if (over) return;
+    if (solo) { MM.status(`<span class="chip" style="background:${BLUE}">Roll or hold!</span>`); return; }
+    const who = vsAI ? (turn === 1 ? 'Your turn' : 'Computer rolling…') : nameOf(turn) + '\'s turn';
+    MM.status(`<span class="chip" style="background:${turn === 1 ? BLUE : RED}">${pigEmoji(turn)} ${who}</span>`);
+  }
+
+  function updateButtons() {
+    const myTurn = !over && !busy && (solo || !vsAI || turn === 1);
+    rollBtn.disabled = !myTurn;
+    holdBtn.disabled = !myTurn || turnTotal === 0;
+    // buttons hidden entirely for AI's turn to reduce temptation
+    btnRow.style.visibility = (vsAI && turn === AI && !over) ? 'hidden' : 'visible';
+  }
+
+  async function onRoll() {
+    if (busy || over) return;
+    if (!solo && vsAI && turn === AI) return;
+    started = true; buildPills();
+    busy = true; updateButtons();
+    const v = await rollTheDie();
+    if (v === 1) {
+      // busted!
+      MM.sound.play('wrong');
+      turnTotal = 0;
+      pop(riskEl);
+      refresh();
+      MM.status(`<span class="chip" style="background:${RED}">💥 Oink! Rolled a 1 — turn lost!</span>`);
+      await MM.sleep(900);
+      endTurn(false);
+    } else {
+      MM.sound.play('pop');
+      turnTotal += v;
+      pop(riskEl);
+      refresh();
+      // check instant win availability (can't win by rolling — only by banking; but Pig usually banks; keep rolling allowed)
+      busy = false;
+      statusUpdate();
+      updateButtons();
+    }
+  }
+
+  async function onHold() {
+    if (busy || over || turnTotal === 0) return;
+    if (!solo && vsAI && turn === AI) return;
+    busy = true; updateButtons();
+    MM.sound.play('ding');
+    score[turn] += turnTotal;
+    turnTotal = 0;
+    refresh();
+    if (score[turn] >= target) { win(turn); return; }
+    await MM.sleep(400);
+    endTurn(true);
+  }
+
+  function endTurn(banked) {
+    turnTotal = 0;
+    if (solo) {
+      turnsTaken++;
+      if (score[1] >= target) { win(1); return; }
+      refresh();
+      busy = false;
+      statusUpdate();
+      updateButtons();
+      return;
+    }
+    // switch player
+    turn = turn === 1 ? 2 : 1;
+    refresh();
+    busy = false;
+    statusUpdate();
+    updateButtons();
+    if (vsAI && turn === AI && !over) setTimeout(aiTurn, 650);
+  }
+
+  async function rollTheDie() {
+    // suspenseful roll: animate then settle
+    const v = await MM.rollDie(dieEl, 6);
+    return v;
+  }
+
+  function win(p) {
+    over = true; busy = true;
+    updateButtons();
+    if (solo) {
+      const turns = turnsTaken + 1; // this hold counts as a turn
+      const record = (best == null || turns < best);
+      if (record) MM.store('pig-best-turns', turns);
+      MM.status('');
+      MM.win({
+        title: 'You reached ' + target + '! 🎉',
+        emoji: '⭐',
+        sub: 'Done in ' + turns + ' turn' + (turns === 1 ? '' : 's') + '. ' +
+             (record ? 'NEW BEST! 🏆' : (best != null ? 'Best: ' + best : '')),
+        onAgain: () => MM.toMenu(),
+      });
+      return;
+    }
+    const youWin = vsAI && p === 1;
+    MM.status('');
+    if (vsAI) {
+      MM.win({
+        lose: !youWin,
+        title: youWin ? 'You win! 🎉' : 'Computer wins!',
+        emoji: youWin ? '🏆' : '🤖',
+        sub: nameOf(p) + ' reached ' + target + ' first.',
+        onAgain: () => MM.toMenu(),
+      });
+    } else {
+      MM.win({
+        title: nameOf(p) + ' wins! 🎉',
+        emoji: p === 1 ? '🐷' : '🐖',
+        sub: 'First to ' + target + '!',
+        onAgain: () => MM.toMenu(),
+      });
+    }
+  }
+
+  // ---------- AI: hold-at-20, adjusted for score gap ----------
+  // Classic policy: hold when turnTotal >= 20, OR when banked+turn reaches target.
+  // Adjust: if far behind, be greedier (raise threshold); if ahead & close, be safer.
+  function aiThreshold() {
+    const my = score[AI], opp = score[1];
+    const gap = opp - my;            // + = AI behind
+    let hold = 20;
+    if (gap > 20) hold = 28;         // way behind: gamble more
+    else if (gap > 8) hold = 24;     // behind: push a bit
+    else if (gap < -12) hold = 16;   // comfortably ahead: play safe
+    // never risk overshooting need: if a small total already wins, don't need more
+    return hold;
+  }
+
+  async function aiTurn() {
+    if (over) return;
+    busy = true; updateButtons();
+    turnTotal = 0; refresh();
+    while (!over) {
+      const need = target - score[AI];
+      // if we can already win by holding, hold
+      if (turnTotal >= need) { break; }
+      const hold = aiThreshold();
+      // if we've reached our comfortable threshold, hold (unless a tiny bit more secures the win)
+      if (turnTotal >= hold) break;
+      MM.status(`<span class="chip" style="background:${RED}">🤖 Computer rolls… (has ${turnTotal})</span>`);
+      await MM.sleep(500);
+      const v = await rollTheDie();
+      if (v === 1) {
+        MM.sound.play('wrong');
+        turnTotal = 0; pop(riskEl); refresh();
+        MM.status(`<span class="chip" style="background:${RED}">🤖 Computer rolled a 1 — busted!</span>`);
+        await MM.sleep(950);
+        endTurn(false);
+        return;
+      }
+      MM.sound.play('pop');
+      turnTotal += v; pop(riskEl); refresh();
+      await MM.sleep(320);
+    }
+    // AI holds
+    if (over) return;
+    MM.sound.play('ding');
+    MM.status(`<span class="chip" style="background:${RED}">🤖 Computer holds with ${turnTotal}</span>`);
+    score[AI] += turnTotal;
+    turnTotal = 0; refresh();
+    await MM.sleep(650);
+    if (score[AI] >= target) { win(AI); return; }
+    endTurn(true);
+  }
+
+  function pop(el) {
+    el.style.transform = 'scale(1.35)';
+    setTimeout(() => { el.style.transform = 'scale(1)'; }, 130);
+  }
+}
+</script>
+</body>
+</html>

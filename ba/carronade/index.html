@@ -1,0 +1,424 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Carronade</title>
+<link rel="stylesheet" href="../../assets/common.css">
+</head>
+<body>
+<script src="../../assets/common.js"></script>
+<script>
+/* CARRONADE — a symmetric mini-Battleship on a 5x5 grid. Each player hides
+   single-cell ships (pill: 3, 4, or 5 ships). Players fire at coordinates on
+   the opponent's grid; a hit sinks that ship. First to sink ALL enemy ships
+   wins.
+
+   AI: hunt/target. Smart mode fires on a checkerboard parity until a hit,
+   then targets orthogonal neighbors of hits. Easy mode fires purely at
+   random. Never repeats a shot. */
+
+const GRID = 5;
+const HEX = { 1: '#3a86ff', 2: '#ff5a5f' };
+const COLS = ['A', 'B', 'C', 'D', 'E'];   // column labels
+
+MM.game({
+  title: 'Carronade', emoji: '🚢',
+  ba: 'https://beastacademy.com/playground/carronade',
+  rules: `
+    <p><b>Sink the enemy fleet!</b> Each captain hides their ships 🚢 on a secret 5×5 sea.</p>
+    <ol>
+      <li>Hide your ships by tapping your own grid.</li>
+      <li>Take turns firing 💥 at the enemy's waters 🌊.</li>
+      <li>A <b>hit</b> 💥 sinks that ship. A <b>miss</b> 🌊 shows empty water.</li>
+      <li>The first captain to sink <b>all</b> the enemy's ships <b>wins!</b> 🏆</li>
+    </ol>
+    <p>Remember where you missed to help you hunt down the rest of the fleet! 🔎</p>`,
+  modes: [
+    { id: 'ai',  emoji: '🤖', name: 'Vs Computer', sub: 'You vs the robot navy' },
+    { id: 'two', emoji: '🧑‍🤝‍🧑', name: '2 Players', sub: 'Pass & hide' },
+  ],
+  onStart,
+});
+
+function onStart(mode, mount) {
+  const vsAI = (mode === 'ai');
+
+  // options
+  let shipCount = MM.load('carr-ships', 3);   // 3,4,5 single-cell ships
+  let aiSmart = MM.load('carr-smart', true);  // Smart vs Easy AI
+
+  const panel = MM.el('div', { class: 'mm-panel mm-center mm-bounce-in' });
+  mount.appendChild(panel);
+
+  const N = GRID * GRID;
+  const rc = (i) => [Math.floor(i / GRID), i % GRID];
+  const coordName = (i) => { const [r, c] = rc(i); return COLS[c] + (r + 1); };
+  const neighbors = (i) => {
+    const [r, c] = rc(i); const out = [];
+    if (r > 0) out.push(i - GRID);
+    if (r < GRID - 1) out.push(i + GRID);
+    if (c > 0) out.push(i - 1);
+    if (c < GRID - 1) out.push(i + 1);
+    return out;
+  };
+
+  function label(pl) { return vsAI ? (pl === 1 ? 'You' : 'Computer') : ('Player ' + pl); }
+
+  // per-player state
+  function newPlayer() {
+    return {
+      ships: new Set(),          // cell indices with a ship
+      shotsAt: new Array(N).fill(0), // shots taken AGAINST this player: 0 none, 1 miss, 2 hit
+    };
+  }
+  let P = { 1: newPlayer(), 2: newPlayer() };
+  let turn = 1;
+  let over = false;
+  let busy = false;
+
+  // AI hunt/target memory (targets on player 1's board)
+  let aiHunt = [];   // queue of promising cells to try next
+
+  function cellSize() {
+    return Math.max(46, Math.min(74, Math.floor((Math.min(window.innerWidth - 48, 420)) / (GRID + 1))));
+  }
+
+  /* -------- a grid renderer. onCell(i) called when a cell is tapped.
+     showShips: reveal owner ships. mark uses shotsAt of `boardOwner`. -------- */
+  function buildGrid(boardOwner, opts) {
+    opts = opts || {};
+    const sz = cellSize();
+    const pl = P[boardOwner];
+    const table = MM.el('div', {
+      style: {
+        display: 'inline-grid',
+        gridTemplateColumns: 'auto repeat(' + GRID + ', ' + sz + 'px)',
+        gap: '4px', background: '#cfe8ff', padding: '10px', borderRadius: '18px',
+        boxShadow: 'inset 0 0 0 4px #a9d5f5',
+      },
+    });
+    // header row: corner + column letters
+    table.appendChild(MM.el('div', {}));
+    for (let c = 0; c < GRID; c++) {
+      table.appendChild(MM.el('div', { style: { fontWeight: '800', color: '#3a6ea5', alignSelf: 'center', fontSize: '15px' } }, COLS[c]));
+    }
+    for (let r = 0; r < GRID; r++) {
+      table.appendChild(MM.el('div', { style: { fontWeight: '800', color: '#3a6ea5', alignSelf: 'center', fontSize: '15px' } }, String(r + 1)));
+      for (let c = 0; c < GRID; c++) {
+        const i = r * GRID + c;
+        const shot = pl.shotsAt[i];
+        const hasShip = pl.ships.has(i);
+        let content = '', bg = '#eaf6ff';
+        if (shot === 2) { content = '💥'; bg = '#ffd7d9'; }
+        else if (shot === 1) { content = '🌊'; bg = '#bfe3ff'; }
+        else if (opts.showShips && hasShip) { content = '🚢'; bg = '#d4f5ef'; }
+        const cell = MM.el('div', {
+          style: {
+            width: sz + 'px', height: sz + 'px', borderRadius: '12px', background: bg,
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            fontSize: Math.floor(sz * 0.5) + 'px', boxShadow: 'inset 0 -3px 0 rgba(0,0,0,.08)',
+            cursor: opts.onCell && shot === 0 ? 'pointer' : 'default',
+            transition: 'transform .1s ease',
+          },
+        }, content);
+        if (opts.onCell) {
+          cell.addEventListener('click', () => opts.onCell(i, cell));
+        }
+        table.appendChild(cell);
+      }
+    }
+    return table;
+  }
+
+  function scorebar() {
+    const rem = (pl) => shipCount - Array.from(P[pl].ships).filter(i => P[pl].shotsAt[i] === 2).length;
+    return MM.el('div', { class: 'mm-scorebar' },
+      MM.el('div', { class: 'mm-score' },
+        MM.el('span', { class: 'dot', style: { background: HEX[1] } }),
+        MM.el('span', {}, label(1) + ' fleet: ' + '🚢'.repeat(rem(1)))),
+      MM.el('div', { class: 'mm-score' },
+        MM.el('span', { class: 'dot', style: { background: HEX[2] } }),
+        MM.el('span', {}, label(2) + ' fleet: ' + '🚢'.repeat(rem(2)))),
+    );
+  }
+
+  /* ---------------- SETUP: options + placement ---------------- */
+  function setupScreen() {
+    panel.innerHTML = '';
+    MM.status('<span class="chip" style="background:#ff9f1c">Ready the fleet</span>');
+    panel.appendChild(MM.el('h2', { class: 'mm-center', style: { marginTop: '4px' } }, '🚢 Battle setup'));
+
+    // ship count pills
+    panel.appendChild(MM.el('div', { style: { fontWeight: '800', marginTop: '6px' } }, 'How many ships each?'));
+    const shipRow = MM.el('div', { class: 'mm-pills', style: { margin: '8px 0 4px' } });
+    [3, 4, 5].forEach(v => {
+      shipRow.appendChild(MM.el('button', {
+        class: 'mm-pill', 'aria-pressed': String(v === shipCount),
+        onClick: () => { MM.sound.play('click'); shipCount = v; MM.store('carr-ships', v); setupScreen(); },
+      }, '🚢 ' + v));
+    });
+    panel.appendChild(shipRow);
+
+    if (vsAI) {
+      panel.appendChild(MM.el('div', { style: { fontWeight: '800', marginTop: '14px' } }, 'Robot skill'));
+      const aiRow = MM.el('div', { class: 'mm-pills', style: { margin: '8px 0 4px' } });
+      [[false, '🙂 Easy'], [true, '🧠 Smart']].forEach(([v, txt]) => {
+        aiRow.appendChild(MM.el('button', {
+          class: 'mm-pill', 'aria-pressed': String(v === aiSmart),
+          onClick: () => { MM.sound.play('click'); aiSmart = v; MM.store('carr-smart', v); setupScreen(); },
+        }, txt));
+      });
+      panel.appendChild(aiRow);
+    }
+
+    panel.appendChild(MM.el('div', { class: 'mm-row' },
+      MM.el('button', {
+        class: 'mm-btn green', style: { fontSize: '20px', padding: '14px 30px', minHeight: '54px', marginTop: '14px' },
+        onClick: () => { MM.sound.play('pop'); startPlacement(); },
+      }, '⚓ Place ships')));
+  }
+
+  function randomShips(pl) {
+    pl.ships.clear();
+    const cells = MM.shuffle(Array.from({ length: N }, (_, i) => i));
+    for (let k = 0; k < shipCount; k++) pl.ships.add(cells[k]);
+  }
+
+  function startPlacement() {
+    // reset boards
+    P = { 1: newPlayer(), 2: newPlayer() };
+    over = false; busy = false; aiHunt = [];
+    turn = 1;
+
+    if (vsAI) {
+      randomShips(P[2]);                 // hide computer's fleet
+      placementScreen(1, () => startFiring());
+    } else {
+      // pass-and-hide: P1 places, cover, P2 places
+      cover(1, () => placementScreen(1, () => {
+        cover(2, () => placementScreen(2, () => startFiring()));
+      }));
+    }
+  }
+
+  function cover(who, onReady) {
+    panel.innerHTML = '';
+    panel.appendChild(MM.el('div', { class: 'mm-center', style: { padding: '18px 6px' } },
+      MM.el('div', { style: { fontSize: '64px' } }, '🙈'),
+      MM.el('h2', {}, 'Pass the device to'),
+      MM.el('div', { style: { fontSize: '26px', fontWeight: '800', color: HEX[who], margin: '4px 0 12px' } }, label(who)),
+      MM.el('div', { class: 'mm-hint' }, 'Everyone else, no peeking! 👀'),
+      MM.el('button', {
+        class: 'mm-btn', style: { fontSize: '20px', padding: '14px 30px', minHeight: '54px', background: HEX[who] },
+        onClick: () => { MM.sound.play('swoosh'); onReady(); },
+      }, "👉 I'm " + label(who) + ' — ready!')));
+  }
+
+  function placementScreen(who, onDone) {
+    const pl = P[who];
+    pl.ships.clear();
+
+    function render() {
+      panel.innerHTML = '';
+      MM.status('<span class="chip" style="background:' + HEX[who] + '">' + label(who) + ' — hide ' + shipCount + ' ships</span>');
+      panel.appendChild(MM.el('h2', { class: 'mm-center', style: { marginTop: '2px' } }, '⚓ ' + label(who) + ': hide your fleet'));
+      const left = shipCount - pl.ships.size;
+      panel.appendChild(MM.el('div', { style: { fontWeight: '800', fontSize: '19px', margin: '4px 0 8px' } },
+        left > 0 ? ('Tap the sea to place ' + left + ' more ship' + (left === 1 ? '' : 's') + ' 🚢') : 'Fleet ready! ✅'));
+      const grid = buildGrid(who, {
+        showShips: true,
+        onCell: (i) => {
+          if (pl.ships.has(i)) { pl.ships.delete(i); MM.sound.play('click'); render(); return; }
+          if (pl.ships.size >= shipCount) { MM.sound.play('wrong'); return; }
+          pl.ships.add(i); MM.sound.play('place'); render();
+        },
+      });
+      // override: allow tapping ship cells to remove (buildGrid only wires empty cells' cursor,
+      // but click handler is attached to every cell, so removal works).
+      panel.appendChild(grid);
+      panel.appendChild(MM.el('div', { class: 'mm-hint' }, 'Tap a ship to move it. Tap an empty square to place one.'));
+
+      const row = MM.el('div', { class: 'mm-row', style: { marginTop: '10px' } });
+      row.appendChild(MM.el('button', {
+        class: 'mm-btn ghost', style: { minHeight: '48px' },
+        onClick: () => { MM.sound.play('roll'); randomShips(pl); render(); },
+      }, '🎲 Random'));
+      const done = MM.el('button', {
+        class: 'mm-btn green', style: { minHeight: '54px', fontSize: '19px' },
+        onClick: () => { if (pl.ships.size === shipCount) { MM.sound.play('ding'); onDone(); } },
+      }, '✅ Ships ready!');
+      done.disabled = pl.ships.size !== shipCount;
+      row.appendChild(done);
+      panel.appendChild(row);
+    }
+    render();
+  }
+
+  /* ---------------- FIRING ---------------- */
+  function allSunk(pl) { return Array.from(pl.ships).every(i => pl.shotsAt[i] === 2); }
+
+  function startFiring() {
+    turn = 1;
+    if (vsAI) firingScreenAI();
+    else firingScreenTwo();
+  }
+
+  // Vs AI: single screen, two grids. Human fires at enemy (P2); AI fires back at P1.
+  function firingScreenAI() {
+    render();
+    function render() {
+      panel.innerHTML = '';
+      panel.appendChild(scorebar());
+      const yourTurn = turn === 1 && !over && !busy;
+      MM.status(over ? '' : '<span class="chip" style="background:' + HEX[turn] + '">' + (turn === 1 ? 'Fire at the enemy! 💥' : 'Computer is aiming…') + '</span>');
+
+      const wrap = MM.el('div', { style: { display: 'flex', gap: '18px', justifyContent: 'center', flexWrap: 'wrap' } });
+
+      // enemy waters (fire here)
+      const enemyBox = MM.el('div', {},
+        MM.el('div', { style: { fontWeight: '800', color: HEX[2], marginBottom: '6px' } }, '🎯 Enemy waters'),
+        buildGrid(2, { showShips: false, onCell: yourTurn ? (i) => humanFire(i) : null }));
+      // your fleet
+      const youBox = MM.el('div', {},
+        MM.el('div', { style: { fontWeight: '800', color: HEX[1], marginBottom: '6px' } }, '🚢 Your fleet'),
+        buildGrid(1, { showShips: true }));
+      wrap.append(enemyBox, youBox);
+      panel.appendChild(wrap);
+      panel.appendChild(MM.el('div', { class: 'mm-hint' },
+        yourTurn ? 'Tap a square in the Enemy waters to fire!' : 'Watch out — incoming fire!'));
+    }
+
+    async function humanFire(i) {
+      if (over || busy || turn !== 1) return;
+      if (P[2].shotsAt[i] !== 0) return;
+      busy = true;
+      const hit = P[2].ships.has(i);
+      P[2].shotsAt[i] = hit ? 2 : 1;
+      MM.sound.play(hit ? 'ding' : 'swoosh');
+      render();
+      await MM.sleep(hit ? 120 : 80);
+      if (hit && !allSunk(P[2])) MM.sound.play('pop');
+      if (allSunk(P[2])) { finish(1); return; }
+      // pass to AI
+      turn = 2; render();
+      await MM.sleep(650);
+      await aiFire();
+      if (over) return;
+      turn = 1; busy = false; render();
+    }
+
+    async function aiFire() {
+      const target = chooseAITarget();
+      const hit = P[1].ships.has(target);
+      P[1].shotsAt[target] = hit ? 2 : 1;
+      MM.sound.play(hit ? 'ding' : 'swoosh');
+      // update hunt memory
+      updateHuntAfterShot(target, hit);
+      render();
+      await MM.sleep(500);
+      if (allSunk(P[1])) { finish(2); return; }
+    }
+  }
+
+  // 2 players: alternate firing with a cover between turns.
+  function firingScreenTwo() {
+    let shooter = 1;   // who is firing
+    coverThenFire();
+
+    function coverThenFire() {
+      cover(shooter, () => fireScreen());
+    }
+
+    function fireScreen() {
+      const targetOwner = shooter === 1 ? 2 : 1;   // fire at opponent's board
+      panel.innerHTML = '';
+      panel.appendChild(scorebar());
+      MM.status('<span class="chip" style="background:' + HEX[shooter] + '">' + label(shooter) + ' — fire! 💥</span>');
+      panel.appendChild(MM.el('h2', { class: 'mm-center', style: { marginTop: '2px' } },
+        '🎯 ' + label(shooter) + ", fire at " + label(targetOwner) + "'s waters"));
+      panel.appendChild(buildGrid(targetOwner, {
+        showShips: false,
+        onCell: (i) => humanFire(i),
+      }));
+      panel.appendChild(MM.el('div', { class: 'mm-hint' }, 'Tap a square to fire. One shot per turn!'));
+
+      async function humanFire(i) {
+        if (over || busy) return;
+        if (P[targetOwner].shotsAt[i] !== 0) return;
+        busy = true;
+        const hit = P[targetOwner].ships.has(i);
+        P[targetOwner].shotsAt[i] = hit ? 2 : 1;
+        MM.sound.play(hit ? 'ding' : 'swoosh');
+        // re-render this fire screen to show the result
+        panel.innerHTML = '';
+        panel.appendChild(scorebar());
+        panel.appendChild(MM.el('h2', { class: 'mm-center', style: { marginTop: '2px' } },
+          hit ? '💥 HIT!' : '🌊 Splash — a miss.'));
+        panel.appendChild(buildGrid(targetOwner, { showShips: false }));
+        await MM.sleep(500);
+        if (hit && !allSunk(P[targetOwner])) MM.sound.play('pop');
+        if (allSunk(P[targetOwner])) { finish(shooter); return; }
+        // next player's turn
+        const nextBtn = MM.el('button', {
+          class: 'mm-btn', style: { fontSize: '20px', padding: '14px 28px', minHeight: '54px', marginTop: '10px' },
+          onClick: () => { MM.sound.play('click'); shooter = shooter === 1 ? 2 : 1; busy = false; coverThenFire(); },
+        }, '👉 Pass to ' + label(shooter === 1 ? 2 : 1));
+        panel.appendChild(MM.el('div', { class: 'mm-row' }, nextBtn));
+      }
+    }
+  }
+
+  /* ---------------- AI targeting (fires at player 1) ---------------- */
+  function chooseAITarget() {
+    const untried = [];
+    for (let i = 0; i < N; i++) if (P[1].shotsAt[i] === 0) untried.push(i);
+    if (!aiSmart) return MM.choice(untried);   // Easy: pure random
+
+    // Smart: drain hunt queue first
+    aiHunt = aiHunt.filter(i => P[1].shotsAt[i] === 0);
+    if (aiHunt.length) return aiHunt[0];
+
+    // otherwise fire on a checkerboard parity for efficiency
+    const parityCells = untried.filter(i => { const [r, c] = rc(i); return (r + c) % 2 === 0; });
+    return MM.choice(parityCells.length ? parityCells : untried);
+  }
+
+  function updateHuntAfterShot(i, hit) {
+    if (!aiSmart) return;
+    // remove the fired cell from the queue
+    aiHunt = aiHunt.filter(x => x !== i && P[1].shotsAt[x] === 0);
+    if (hit) {
+      // single-cell ships: a hit sinks it, so no chained hunting needed. But if
+      // ships could be adjacent, queue neighbors to be safe/greedy.
+      for (const nb of neighbors(i)) if (P[1].shotsAt[nb] === 0 && !aiHunt.includes(nb)) aiHunt.push(nb);
+    }
+  }
+
+  /* ---------------- finish ---------------- */
+  function finish(winner) {
+    over = true; busy = false;
+    if (vsAI) {
+      const youWin = winner === 1;
+      MM.win({
+        lose: !youWin,
+        title: youWin ? 'Enemy fleet sunk! 🎉' : 'Your fleet is sunk!',
+        emoji: youWin ? '🏆' : '🤖',
+        sub: youWin ? 'You win the battle, Captain!' : 'The robot navy wins this one. Rematch?',
+        onAgain: () => MM.toMenu(),
+      });
+    } else {
+      MM.win({
+        title: label(winner) + ' wins the battle! 🎉',
+        emoji: winner === 1 ? '🔵' : '🔴',
+        sub: 'All enemy ships sunk!',
+        onAgain: () => MM.toMenu(),
+      });
+    }
+  }
+
+  setupScreen();
+}
+</script>
+</body>
+</html>

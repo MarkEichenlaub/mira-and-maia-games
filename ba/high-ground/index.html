@@ -1,0 +1,428 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>High Ground</title>
+<link rel="stylesheet" href="../../assets/common.css">
+</head>
+<body>
+<script src="../../assets/common.js"></script>
+<script>
+/* HIGH GROUND — 5x5 grid.
+   Setup: Player 1 writes a 0 somewhere; Player 2 writes a 0 somewhere.
+   Then, starting with Player 2, players alternate. On a turn you pick one of YOUR
+   existing numbers and write (that number + 1) into an ADJACENT empty cell (all 8
+   neighbours). Cells can't be reused. Play until the grid is full. Whoever wrote the
+   single HIGHEST number wins (ties broken by count of that highest — see below).
+
+   AI: alpha-beta minimax with a heuristic (my max - opp max, plus growth/mobility
+   tie-breakers). Full search is too big (25 cells) so we depth-limit (2-4 plies)
+   and add a difficulty pill (Easy plays greedy-random, Smart searches). */
+
+const N = 5;
+const HEX = { 1: '#3a86ff', 2: '#ff5a5f' };
+const SOFT = { 1: '#dbe9ff', 2: '#ffe0e1' };
+// 8-neighbour offsets
+const DIRS = [[-1,-1],[-1,0],[-1,1],[0,-1],[0,1],[1,-1],[1,0],[1,1]];
+
+MM.game({
+  title: 'High Ground', emoji: '⛰️',
+  ba: 'https://beastacademy.com/playground/high-ground',
+  rules: `
+    <p><b>Climb the highest!</b> On a 5×5 grid you build chains of numbers.</p>
+    <ol>
+      <li>First, each player writes a <b>0</b> in any empty square (in their color).</li>
+      <li>After that, on your turn tap one of <b>your</b> numbers, then a touching empty
+          square (including diagonals) to write the <b>next number</b> there.</li>
+      <li>Keep going until the whole grid is full.</li>
+      <li>Whoever wrote the single <b>highest number</b> <b>WINS!</b> 🏔️</li>
+    </ol>
+    <p><b>Tip:</b> keep open space around your biggest number so you can keep climbing —
+    and try to box in your opponent!</p>`,
+  modes: [
+    { id: 'ai',  emoji: '🤖', name: 'Vs Computer', sub: 'You are blue' },
+    { id: 'two', emoji: '🧑‍🤝‍🧑', name: '2 Players', sub: 'Pass & play' },
+  ],
+  onStart,
+});
+
+function onStart(mode, mount) {
+  const vsAI = mode === 'ai';
+  const AI = 2;                          // computer is player 2
+  let hard = MM.load('hg-hard', true);
+
+  // grid[r][c] = { pl, val } or null
+  let grid, phase, turn, over, busy, selected;
+
+  const panel = MM.el('div', { class: 'mm-panel mm-center mm-bounce-in' });
+
+  const pillRow = MM.el('div', { class: 'mm-pills', style: { marginBottom: '12px' } });
+  function buildPills() {
+    pillRow.innerHTML = '';
+    if (!vsAI) return;
+    pillRow.appendChild(MM.el('span', { style: { fontWeight: '800', alignSelf: 'center', marginRight: '2px' } }, 'Robot:'));
+    [['Easy', false, '🐣'], ['Smart', true, '🧠']].forEach(([name, val, em]) => {
+      pillRow.appendChild(MM.el('button', {
+        class: 'mm-pill', 'aria-pressed': String(val === hard),
+        onClick: () => { if (busy) return; MM.sound.play('click'); hard = val; MM.store('hg-hard', val); buildPills(); reset(); },
+      }, em + ' ' + name));
+    });
+  }
+
+  // scorebar showing each player's current highest
+  const scorebar = MM.el('div', { class: 'mm-scorebar' });
+  const boardEl = MM.el('div', { class: 'hg-board' });
+  const hint = MM.el('div', { class: 'mm-hint' });
+
+  // size the board from the viewport
+  const boardPx = Math.min(440, window.innerWidth - 40);
+  boardEl.style.width = boardPx + 'px';
+
+  panel.append(pillRow, scorebar, boardEl, hint);
+  mount.appendChild(panel);
+
+  // ---------- helpers ----------
+  function inB(r, c) { return r >= 0 && r < N && c >= 0 && c < N; }
+  function neighbors(r, c) { const out = []; for (const [dr, dc] of DIRS) { const nr = r + dr, nc = c + dc; if (inB(nr, nc)) out.push([nr, nc]); } return out; }
+  function cloneGrid(g) { return g.map(row => row.map(cell => cell ? { pl: cell.pl, val: cell.val } : null)); }
+  function fullCount(g) { let n = 0; for (let r = 0; r < N; r++) for (let c = 0; c < N; c++) if (g[r][c]) n++; return n; }
+  function playerMax(g, pl) { let m = -1; for (let r = 0; r < N; r++) for (let c = 0; c < N; c++) { const x = g[r][c]; if (x && x.pl === pl && x.val > m) m = x.val; } return m; }
+  function countAt(g, pl, v) { let n = 0; for (let r = 0; r < N; r++) for (let c = 0; c < N; c++) { const x = g[r][c]; if (x && x.pl === pl && x.val === v) n++; } return n; }
+
+  // all legal "climb" moves for pl on grid g -> {sr,sc,tr,tc,val}
+  function legalMoves(g, pl) {
+    const moves = [];
+    for (let r = 0; r < N; r++) for (let c = 0; c < N; c++) {
+      const cell = g[r][c];
+      if (!cell || cell.pl !== pl) continue;
+      for (const [nr, nc] of neighbors(r, c)) {
+        if (!g[nr][nc]) moves.push({ sr: r, sc: c, tr: nr, tc: nc, val: cell.val + 1 });
+      }
+    }
+    return moves;
+  }
+
+  // ---------- render ----------
+  function render() {
+    boardEl.innerHTML = '';
+    // Which of MY numbers can currently extend? (for highlighting)
+    const myMovable = new Set();
+    const legalTargets = new Set();
+    const humanControls = !over && (!vsAI || turn !== AI);
+    if (phase === 'play' && humanControls) {
+      for (const m of legalMoves(grid, turn)) {
+        myMovable.add(m.sr + ',' + m.sc);
+        if (selected && selected.r === m.sr && selected.c === m.sc) legalTargets.add(m.tr + ',' + m.tc);
+      }
+    }
+    for (let r = 0; r < N; r++) {
+      for (let c = 0; c < N; c++) {
+        const cell = grid[r][c];
+        const el = MM.el('div', { class: 'hg-cell' });
+        if (cell) {
+          el.classList.add(cell.pl === 1 ? 'p1' : 'p2');
+          el.appendChild(MM.el('span', { class: 'hg-num' }, String(cell.val)));
+          if (selected && selected.r === r && selected.c === c) el.classList.add('sel');
+          if (myMovable.has(r + ',' + c)) el.classList.add('movable');
+          if (cell.pl === turn && humanControls) {
+            el.addEventListener('click', () => onSourceClick(r, c));
+            el.classList.add('tap');
+          }
+        } else {
+          // empty: is it a legal target?
+          if (phase === 'setup' && humanControls) { el.classList.add('open', 'tap'); el.addEventListener('click', () => onEmptyClick(r, c)); }
+          else if (legalTargets.has(r + ',' + c)) { el.classList.add('target', 'tap'); el.appendChild(MM.el('span', { class: 'hg-ghost' }, String(grid[selected.r][selected.c].val + 1))); el.addEventListener('click', () => onEmptyClick(r, c)); }
+        }
+        boardEl.appendChild(el);
+      }
+    }
+    renderScore();
+    statusUpdate();
+  }
+
+  function renderScore() {
+    scorebar.innerHTML = '';
+    [1, 2].forEach(pl => {
+      const m = playerMax(grid, pl);
+      const name = vsAI ? (pl === AI ? '🤖 Computer' : '🧒 You') : ('Player ' + pl);
+      const s = MM.el('div', { class: 'mm-score' + (turn === pl && !over ? ' active' : '') },
+        MM.el('span', { class: 'dot', style: { background: HEX[pl] } }),
+        name, MM.el('span', { style: { color: HEX[pl] } }, 'top: ' + (m < 0 ? '–' : m)));
+      scorebar.appendChild(s);
+    });
+  }
+
+  function statusUpdate() {
+    if (over) return;
+    let msg;
+    if (phase === 'setup') {
+      const who = vsAI ? (turn === AI ? '🤖 Computer' : '🧒 You') : ('Player ' + turn);
+      msg = who + ': place your <b>0</b>';
+    } else {
+      const who = vsAI ? (turn === AI ? '🤖 Computer…' : '🧒 Your turn') : ('Player ' + turn + "'s turn");
+      msg = who;
+    }
+    MM.status(`<span class="chip" style="background:${HEX[turn]}">${msg}</span>`);
+    if (over) { hint.textContent = ''; return; }
+    if (vsAI && turn === AI) hint.textContent = 'The computer is thinking…';
+    else if (phase === 'setup') hint.textContent = 'Tap any square to write your 0.';
+    else if (selected) hint.textContent = 'Tap a glowing square to climb to ' + (grid[selected.r][selected.c].val + 1) + '.';
+    else hint.textContent = 'Tap one of your numbers (glowing ones can grow).';
+  }
+
+  // ---------- interaction ----------
+  function onEmptyClick(r, c) {
+    if (over || busy) return;
+    if (vsAI && turn === AI) return;
+    if (phase === 'setup') { placeZero(r, c, turn); return; }
+    if (!selected) return;
+    const ok = legalMoves(grid, turn).some(m => m.sr === selected.r && m.sc === selected.c && m.tr === r && m.tc === c);
+    if (!ok) return;
+    doClimb(selected.r, selected.c, r, c, turn);
+  }
+  function onSourceClick(r, c) {
+    if (over || busy || phase !== 'play') return;
+    if (vsAI && turn === AI) return;
+    const cell = grid[r][c];
+    if (!cell || cell.pl !== turn) return;
+    // only selectable if it can actually extend
+    const canGrow = legalMoves(grid, turn).some(m => m.sr === r && m.sc === c);
+    if (!canGrow) { MM.sound.play('wrong'); return; }
+    MM.sound.play('click');
+    selected = (selected && selected.r === r && selected.c === c) ? null : { r, c };
+    render();
+  }
+
+  // ---------- moves ----------
+  function placeZero(r, c, pl) {
+    grid[r][c] = { pl, val: 0 };
+    MM.sound.play('place');
+    afterMove();
+  }
+  function doClimb(sr, sc, tr, tc, pl) {
+    const v = grid[sr][sc].val + 1;
+    grid[tr][tc] = { pl, val: v };
+    selected = null;
+    MM.sound.play('pop');
+    afterMove();
+  }
+
+  // advance phase/turn, check end, trigger AI
+  function afterMove() {
+    // setup: P1 places 0, then P2 places 0, then play starts with P2.
+    if (phase === 'setup') {
+      if (turn === 1) { turn = 2; render(); maybeAI(); return; }
+      // turn was 2 -> both zeros placed. Play begins, and it's still Player 2's move.
+      phase = 'play';
+      render();
+      // Player 2 moves first in play phase (per rules). turn stays 2.
+      maybeAI();
+      return;
+    }
+    // play phase
+    if (fullCount(grid) === N * N) { finish(); return; }
+    turn = turn === 1 ? 2 : 1;
+    // If the player to move has no legal climb, skip them (rare, but keep game moving).
+    if (legalMoves(grid, turn).length === 0) {
+      const other = turn === 1 ? 2 : 1;
+      if (legalMoves(grid, other).length === 0) { finish(); return; }
+      turn = other;
+    }
+    selected = null;
+    render();
+    maybeAI();
+  }
+
+  function maybeAI() {
+    if (over) return;
+    if (vsAI && turn === AI) { busy = true; statusUpdate(); setTimeout(aiTurn, 550); }
+  }
+
+  // ---------- AI ----------
+  // Setup: place the 0 somewhere central-ish with lots of room; avoid hugging opponent.
+  function aiPlaceZero() {
+    let best = null, bestScore = -Infinity;
+    const cand = [];
+    for (let r = 0; r < N; r++) for (let c = 0; c < N; c++) if (!grid[r][c]) cand.push([r, c]);
+    for (const [r, c] of MM.shuffle(cand)) {
+      let score = neighbors(r, c).filter(([nr, nc]) => !grid[nr][nc]).length;   // open room
+      score += (2 - Math.abs(r - 2)) + (2 - Math.abs(c - 2));                    // centrality
+      // if smart, prefer NOT adjacent to opponent's zero (keeps them from racing us)
+      if (hard) { for (const [nr, nc] of neighbors(r, c)) { const x = grid[nr][nc]; if (x && x.pl !== AI) score -= 1.5; } }
+      if (score > bestScore) { bestScore = score; best = [r, c]; }
+    }
+    placeZero(best[0], best[1], AI);
+  }
+
+  // Heuristic for grid from AI perspective.
+  function evaluate(g) {
+    const myMax = playerMax(g, AI), opMax = playerMax(g, AI === 1 ? 2 : 1);
+    let score = (myMax - opMax) * 10;
+    // tie-break at the top: more open room around my top cell = more climb potential.
+    const myMob = legalMoves(g, AI).length, opMob = legalMoves(g, AI === 1 ? 2 : 1).length;
+    score += (myMob - opMob) * 0.4;
+    // reward keeping open neighbours specifically around MY current max cell
+    for (let r = 0; r < N; r++) for (let c = 0; c < N; c++) {
+      const x = g[r][c];
+      if (x && x.pl === AI && x.val === myMax) score += neighbors(r, c).filter(([nr, nc]) => !g[nr][nc]).length * 0.6;
+      if (x && x.pl !== AI && x.val === opMax) score -= neighbors(r, c).filter(([nr, nc]) => !g[nr][nc]).length * 0.5;
+    }
+    return score;
+  }
+
+  // alpha-beta; depth in plies. Returns score from AI perspective.
+  function search(g, toMove, depth, alpha, beta) {
+    if (fullCount(g) === N * N || depth === 0) return evaluate(g);
+    let moves = legalMoves(g, toMove);
+    if (moves.length === 0) {
+      const other = toMove === 1 ? 2 : 1;
+      if (legalMoves(g, other).length === 0) return evaluate(g);
+      return search(g, other, depth, alpha, beta);
+    }
+    // Move ordering: try higher-value writes first (they matter most).
+    moves.sort((a, b) => b.val - a.val);
+    // Cap branching for speed on wide nodes.
+    if (moves.length > 12) moves = moves.slice(0, 12);
+    const opp = toMove === 1 ? 2 : 1;
+    if (toMove === AI) {
+      let best = -Infinity;
+      for (const m of moves) {
+        const saved = g[m.tr][m.tc];
+        g[m.tr][m.tc] = { pl: toMove, val: m.val };
+        best = Math.max(best, search(g, opp, depth - 1, alpha, beta));
+        g[m.tr][m.tc] = saved;
+        alpha = Math.max(alpha, best);
+        if (beta <= alpha) break;
+      }
+      return best;
+    } else {
+      let best = Infinity;
+      for (const m of moves) {
+        const saved = g[m.tr][m.tc];
+        g[m.tr][m.tc] = { pl: toMove, val: m.val };
+        best = Math.min(best, search(g, opp, depth - 1, alpha, beta));
+        g[m.tr][m.tc] = saved;
+        beta = Math.min(beta, best);
+        if (beta <= alpha) break;
+      }
+      return best;
+    }
+  }
+
+  function aiPickClimb() {
+    const moves = legalMoves(grid, AI);
+    if (moves.length === 0) return null;
+    // depth grows as the board fills (fewer branches → deeper safe search)
+    const filled = fullCount(grid);
+    const depth = filled < 10 ? 3 : (filled < 18 ? 4 : 5);
+    let best = null, bestScore = -Infinity;
+    for (const m of MM.shuffle(moves.slice())) {
+      const g = grid;
+      const saved = g[m.tr][m.tc];
+      g[m.tr][m.tc] = { pl: AI, val: m.val };
+      const s = search(g, AI === 1 ? 2 : 1, depth - 1, -Infinity, Infinity);
+      g[m.tr][m.tc] = saved;
+      if (s > bestScore) { bestScore = s; best = m; }
+    }
+    return best;
+  }
+
+  function aiEasyClimb() {
+    const moves = legalMoves(grid, AI);
+    if (moves.length === 0) return null;
+    // greedy-ish: usually just climb from the highest available, sometimes random
+    if (Math.random() < 0.5) return MM.choice(moves);
+    moves.sort((a, b) => b.val - a.val);
+    return moves[0];
+  }
+
+  function aiTurn() {
+    if (over) return;
+    if (phase === 'setup') { aiPlaceZero(); return; }
+    const m = hard ? aiPickClimb() : aiEasyClimb();
+    if (!m) { afterMove(); return; }
+    doClimb(m.sr, m.sc, m.tr, m.tc, AI);
+  }
+
+  // ---------- end ----------
+  function finish() {
+    over = true;
+    selected = null;
+    render();
+    const m1 = playerMax(grid, 1), m2 = playerMax(grid, 2);
+    let winner;
+    if (m1 > m2) winner = 1;
+    else if (m2 > m1) winner = 2;
+    else { // same top number — most copies of it wins, else true tie
+      const c1 = countAt(grid, 1, m1), c2 = countAt(grid, 2, m2);
+      winner = c1 > c2 ? 1 : (c2 > c1 ? 2 : 0);
+    }
+    highlightTop(Math.max(m1, m2));
+    if (winner === 0) {
+      MM.sound.play('ding');
+      MM.win({ lose: false, title: "It's a tie! 🤝", emoji: '🤝', sub: 'Both reached ' + m1 + '!', onAgain: () => MM.toMenu() });
+      return;
+    }
+    if (vsAI) {
+      const youWin = winner !== AI;
+      MM.win({ lose: !youWin, title: youWin ? 'You win! 🎉' : 'Computer wins!',
+        emoji: youWin ? '🏔️' : '🤖',
+        sub: 'Highest number: ' + Math.max(m1, m2), onAgain: () => MM.toMenu() });
+    } else {
+      MM.win({ title: 'Player ' + winner + ' wins! 🎉', emoji: winner === 1 ? '🔵' : '🔴',
+        sub: 'Highest number: ' + Math.max(m1, m2), onAgain: () => MM.toMenu() });
+    }
+  }
+
+  function highlightTop(top) {
+    const cells = boardEl.querySelectorAll('.hg-cell');
+    let i = 0;
+    for (let r = 0; r < N; r++) for (let c = 0; c < N; c++) {
+      const cell = grid[r][c];
+      if (cell && cell.val === top) cells[i].classList.add('crown');
+      i++;
+    }
+  }
+
+  function reset() {
+    grid = Array.from({ length: N }, () => Array(N).fill(null));
+    phase = 'setup'; turn = 1; over = false; busy = false; selected = null;
+    render();
+    // Player 1 places first; if AI were player 1 it'd move, but AI is always P2.
+  }
+
+  buildPills();
+  reset();
+}
+</script>
+<style>
+  .hg-board {
+    display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px;
+    margin: 10px auto; max-width: 100%;
+    background: #efe7d8; padding: 8px; border-radius: 18px; box-shadow: inset 0 3px 8px rgba(0,0,0,.08);
+  }
+  .hg-cell {
+    aspect-ratio: 1 / 1; border-radius: 12px; background: #fff;
+    display: flex; align-items: center; justify-content: center; position: relative;
+    font-weight: 900; box-shadow: 0 3px 0 rgba(0,0,0,.08); min-height: 44px;
+    transition: transform .1s ease, box-shadow .1s ease;
+  }
+  .hg-num { font-size: clamp(20px, 6.5vw, 30px); line-height: 1; }
+  .hg-cell.p1 { background: #3a86ff; } .hg-cell.p1 .hg-num { color: #fff; }
+  .hg-cell.p2 { background: #ff5a5f; } .hg-cell.p2 .hg-num { color: #fff; }
+  .hg-cell.tap { cursor: pointer; }
+  .hg-cell.open:hover { background: #fffdf4; transform: scale(1.04); }
+  .hg-cell.p1.tap:active, .hg-cell.p2.tap:active { transform: translateY(2px); }
+  .hg-cell.movable { outline: 3px solid var(--c-yellow); animation: hgpulse 1.4s ease infinite; }
+  .hg-cell.sel { outline: 4px solid var(--c-purple); transform: scale(1.06); }
+  .hg-cell.target { background: #eaffe9; box-shadow: 0 0 0 3px #2ec4b6 inset; cursor: pointer; animation: hgpulse 1.2s ease infinite; }
+  .hg-cell.target:hover { background: #d6ffd4; }
+  .hg-ghost { font-size: clamp(18px, 6vw, 28px); color: #2ec4b6; opacity: .8; }
+  .hg-cell.crown { animation: hgcrown .8s ease infinite; outline: 4px solid var(--c-yellow); }
+  .hg-cell.crown::after { content: '👑'; position: absolute; top: -14px; font-size: 20px; }
+  @keyframes hgpulse { 0%,100% { box-shadow: 0 0 0 0 rgba(255,210,63,.6), 0 3px 0 rgba(0,0,0,.08); } 50% { box-shadow: 0 0 0 6px rgba(255,210,63,0), 0 3px 0 rgba(0,0,0,.08); } }
+  @keyframes hgcrown { 0%,100% { transform: scale(1); } 50% { transform: scale(1.1); } }
+</style>
+</body>
+</html>

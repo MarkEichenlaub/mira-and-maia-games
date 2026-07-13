@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Sim</title>
+<link rel="stylesheet" href="../../assets/common.css">
+</head>
+<body>
+<script src="../../assets/common.js"></script>
+<script>
+/* SIM — draw lines between 6 dots. Make a triangle in YOUR color and you LOSE.
+   A monochromatic triangle is unavoidable once all 15 edges are drawn (R(3,3)=6),
+   so there are no draws. With perfect play the 2nd player wins. */
+
+const N = 6;
+const EDGES = [];                       // all 15 pairs
+for (let a = 0; a < N; a++) for (let b = a + 1; b < N; b++) EDGES.push([a, b]);
+const eidx = (a, b) => EDGES.findIndex(e => e[0] === Math.min(a,b) && e[1] === Math.max(a,b));
+// triangles (triples of dots) and the 3 edge-indices each uses
+const TRIS = [];
+for (let a = 0; a < N; a++) for (let b = a+1; b < N; b++) for (let c = b+1; c < N; c++)
+  TRIS.push([eidx(a,b), eidx(a,c), eidx(b,c)]);
+
+const COLORS = { 1: 'var(--c-blue)', 2: 'var(--c-red)' };
+const HEX = { 1: '#3a86ff', 2: '#ff5a5f' };
+
+MM.game({
+  title: 'Sim', emoji: '🔺',
+  ba: 'https://beastacademy.com/playground/sim',
+  rules: `
+    <p><b>Don't make a triangle!</b> There are 6 dots. Take turns drawing a line between any two dots in your color.</p>
+    <ol>
+      <li>Tap two dots to connect them with a line.</li>
+      <li>If you ever make a <b>triangle</b> in your own color, you <b>lose</b>! 😮</li>
+      <li>Someone always makes a triangle — so there's always a winner.</li>
+    </ol>
+    <p>Tip: this game is over 100 years old and mathematicians love it!</p>`,
+  modes: [
+    { id: 'ai',  emoji: '🤖', name: 'Vs Computer', sub: 'You are blue' },
+    { id: 'two', emoji: '🧑‍🤝‍🧑', name: '2 Players', sub: 'Pass & play' },
+  ],
+  onStart,
+});
+
+function onStart(mode, mount) {
+  let edges = Array(15).fill(0);        // 0 empty, 1 blue, 2 red
+  let turn = 1;                          // whose move
+  let first = null;                      // first-selected dot
+  let over = false;
+  const vsAI = mode === 'ai';
+  const AI = 2;                          // computer plays red (2nd player = winning seat)
+
+  // layout dots on a circle
+  const size = Math.min(440, window.innerWidth - 40);
+  const R = size / 2 - 30, cx = size / 2, cy = size / 2;
+  const P = [];
+  for (let i = 0; i < N; i++) { const ang = -Math.PI / 2 + i * 2 * Math.PI / N; P.push([cx + R * Math.cos(ang), cy + R * Math.sin(ang)]); }
+
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('viewBox', `0 0 ${size} ${size}`);
+  svg.style.width = size + 'px'; svg.style.maxWidth = '100%'; svg.style.height = 'auto';
+  svg.style.touchAction = 'manipulation';
+
+  const panel = MM.el('div', { class: 'mm-panel mm-center mm-bounce-in' });
+  panel.appendChild(svg);
+  const hint = MM.el('div', { class: 'mm-hint' }, 'Tap a dot, then another dot, to draw a line.');
+  panel.appendChild(hint);
+  mount.appendChild(panel);
+
+  function line(x1, y1, x2, y2, stroke, w, extra) {
+    const l = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+    l.setAttribute('x1', x1); l.setAttribute('y1', y1); l.setAttribute('x2', x2); l.setAttribute('y2', y2);
+    l.setAttribute('stroke', stroke); l.setAttribute('stroke-width', w); l.setAttribute('stroke-linecap', 'round');
+    if (extra) for (const k in extra) l.setAttribute(k, extra[k]);
+    return l;
+  }
+  function render() {
+    svg.innerHTML = '';
+    // faint guides for empty edges
+    EDGES.forEach(([a, b], i) => {
+      if (edges[i] === 0) {
+        const g = line(P[a][0], P[a][1], P[b][0], P[b][1], '#e9e3f2', 6);
+        g.style.cursor = 'pointer';
+        g.addEventListener('click', () => tryEdge(i));
+        svg.appendChild(g);
+      }
+    });
+    EDGES.forEach(([a, b], i) => { if (edges[i]) svg.appendChild(line(P[a][0], P[a][1], P[b][0], P[b][1], HEX[edges[i]], 9)); });
+    // dots
+    P.forEach(([x, y], i) => {
+      const c = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+      c.setAttribute('cx', x); c.setAttribute('cy', y); c.setAttribute('r', 16);
+      c.setAttribute('fill', first === i ? '#ffd23f' : '#fff'); c.setAttribute('stroke', '#22223b'); c.setAttribute('stroke-width', 4);
+      c.style.cursor = 'pointer';
+      c.addEventListener('click', () => dotClick(i));
+      svg.appendChild(c);
+    });
+    statusUpdate();
+  }
+  function statusUpdate() {
+    if (over) return;
+    const who = vsAI ? (turn === 1 ? 'Your turn' : 'Computer…') : 'Player ' + turn;
+    MM.status(`<span class="chip" style="background:${HEX[turn]}">${who}</span>`);
+  }
+
+  function dotClick(i) {
+    if (over || (vsAI && turn === AI)) return;
+    MM.sound.play('click');
+    if (first === null) { first = i; render(); return; }
+    if (first === i) { first = null; render(); return; }
+    tryEdgeDots(first, i);
+  }
+  function tryEdgeDots(a, b) { const i = eidx(a, b); if (edges[i] === 0) commit(i); else { first = null; render(); } }
+  function tryEdge(i) { if (over || (vsAI && turn === AI) || edges[i]) return; commit(i); }
+
+  function makesTriangle(state, color, edgeI) {
+    for (const t of TRIS) if (t.includes(edgeI) && t.every(e => state[e] === color)) return true;
+    return false;
+  }
+
+  function commit(i) {
+    edges[i] = turn; first = null;
+    MM.sound.play('place');
+    const loserMade = makesTriangle(edges, turn, i);
+    render();
+    if (loserMade) { finish(turn); return; }        // the mover made their own triangle → mover loses
+    turn = turn === 1 ? 2 : 1;
+    statusUpdate();
+    if (vsAI && turn === AI && !over) setTimeout(aiMove, 550);
+  }
+
+  function finish(loser) {
+    over = true;
+    const winner = loser === 1 ? 2 : 1;
+    const youWin = vsAI && winner === 1;
+    if (vsAI) {
+      MM.win({ lose: !youWin, title: youWin ? 'You win! 🎉' : 'Computer wins!',
+        emoji: youWin ? '🏆' : '🤖', sub: 'The ' + (loser === 1 ? 'blue' : 'red') + ' triangle lost.',
+        onAgain: () => MM.toMenu() });
+    } else {
+      MM.win({ title: 'Player ' + winner + ' wins! 🎉', emoji: winner === 1 ? '🔵' : '🔴',
+        sub: 'Player ' + loser + ' made a triangle.', onAgain: () => MM.toMenu() });
+    }
+  }
+
+  /* ----- AI: avoid losing, else shallow minimax to push opponent into a loss ----- */
+  function safeMoves(state, color) {
+    const empty = []; for (let i = 0; i < 15; i++) if (state[i] === 0) empty.push(i);
+    const safe = empty.filter(i => !makesTriangle(state, color, i));
+    return { empty, safe };
+  }
+  let nodes = 0;
+  // minimax from `me`'s perspective: +1 = me forces a win, -1 = me loses, 0 = unknown/budget.
+  function minimax(state, toMove, me, depth) {
+    if (nodes++ > 14000 || depth > 9) return 0;
+    const { empty, safe } = safeMoves(state, toMove);
+    if (safe.length === 0) return toMove === me ? -1 : 1;
+    if (empty.length === 0) return 0;
+    let val = toMove === me ? -2 : 2;
+    for (const i of safe) {
+      state[i] = toMove;
+      const r = minimax(state, toMove === 1 ? 2 : 1, me, depth + 1);
+      state[i] = 0;
+      if (toMove === me) { if (r > val) val = r; if (val === 1) break; }
+      else { if (r < val) val = r; if (val === -1) break; }
+    }
+    return val;
+  }
+  function aiMove() {
+    if (over) return;
+    const { empty, safe } = safeMoves(edges, AI);
+    if (safe.length === 0) { commit(MM.choice(empty)); return; } // forced to lose
+    // pick a safe move; prefer one that wins/keeps winning
+    let bestMove = safe[0], bestVal = -2;
+    nodes = 0;
+    const order = MM.shuffle(safe.slice());
+    for (const i of order) {
+      edges[i] = AI;
+      const v = minimax(edges, AI === 1 ? 2 : 1, AI, 0);
+      edges[i] = 0;
+      if (v > bestVal) { bestVal = v; bestMove = i; if (v === 1) break; }
+    }
+    commit(bestMove);
+  }
+
+  render();
+  if (vsAI && turn === AI) setTimeout(aiMove, 500);
+}
+</script>
+</body>
+</html>

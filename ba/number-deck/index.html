@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Number Deck</title>
+<link rel="stylesheet" href="../../assets/common.css">
+<style>
+  .nd-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(96px,1fr)); gap:12px; margin-top:14px; }
+  .nd-card { background:#fff; border-radius:14px; box-shadow:0 4px 0 #e7e0d0; aspect-ratio:3/4;
+             display:flex; flex-direction:column; align-items:center; justify-content:center; padding:8px; border:3px solid #fff; }
+  .nd-num { font-weight:800; font-size:34px; }
+  .nd-dots { display:grid; grid-template-columns:repeat(3,10px); gap:5px; }
+  .nd-dot { width:10px; height:10px; border-radius:50%; }
+  .nd-tally { font-size:24px; letter-spacing:2px; font-weight:800; }
+  .nd-frame { display:grid; grid-template-columns:repeat(5,12px); grid-template-rows:repeat(2,12px); gap:2px; }
+  .nd-cell { width:12px; height:12px; border:1.5px solid #22223b; border-radius:3px; }
+  .nd-cell.on { background:#ff5a5f; }
+  @media print {
+    .mm-topbar, .mm-blob, #mm-mount .noprint, .mm-status { display:none !important; }
+    body { background:#fff !important; }
+    .mm-panel { box-shadow:none; border:none; }
+    .nd-card { box-shadow:none; border:1px solid #ccc; break-inside:avoid; }
+  }
+</style>
+</head>
+<body>
+<script src="../../assets/common.js"></script>
+<script>
+MM.game({
+  title:'Number Deck', emoji:'🎴',
+  ba:'https://beastacademy.com/playground/number-deck',
+  rules:`<p>Lots of Beast Academy games use a <b>Number Deck</b> — cards that show numbers in fun ways.</p>
+    <p>Pick a style, then tap <b>🖨️ Print</b> to make your very own deck to cut out and play with! Try the Dots, Tally marks, Numbers, or Ten-Frames.</p>
+    <p>Use these cards with games like Memory Match, Tens Go Fish, Towers, and Fifteen.</p>`,
+  onStart(mode, mount){
+    const COLORS = ['#ff5a5f','#ff9f1c','#ffd23f','#2ec4b6','#3a86ff','#8338ec','#ff70a6'];
+    let style = 'dots';
+    const grid = MM.el('div', { class:'nd-grid' });
+
+    function dotsCard(n){
+      const wrap = MM.el('div',{class:'nd-dots'});
+      for(let i=0;i<9;i++) wrap.appendChild(MM.el('div',{class:'nd-dot', style:{ background: i<n?COLORS[n%COLORS.length]:'transparent' }}));
+      return wrap;
+    }
+    function tallyCard(n){
+      let s=''; for(let i=0;i<n;i++) s += (i%5===4)?'̸':''; // decorative
+      const groups = Math.floor(n/5), rem = n%5;
+      return MM.el('div',{class:'nd-tally', style:{color:COLORS[n%COLORS.length]}}, '𝍩'.repeat(0) + ('卌 '.repeat(groups)) + '丨'.repeat(rem) || '·');
+    }
+    function frameCard(n){
+      const f = MM.el('div',{class:'nd-frame'});
+      for(let i=0;i<10;i++) f.appendChild(MM.el('div',{class:'nd-cell'+(i<n?' on':'')}));
+      return f;
+    }
+    function render(){
+      grid.innerHTML='';
+      for(let n=0;n<=10;n++){
+        const card = MM.el('div',{class:'nd-card'});
+        if(style==='numerals'){ card.appendChild(MM.el('div',{class:'nd-num', style:{color:COLORS[n%COLORS.length]}}, String(n) + ((n===6||n===9)?'_':''))); }
+        else if(style==='dots'){ card.appendChild(MM.el('div',{class:'nd-num',style:{fontSize:'18px',color:COLORS[n%COLORS.length]}},String(n))); card.appendChild(dotsCard(n)); }
+        else if(style==='tally'){ card.appendChild(MM.el('div',{class:'nd-num',style:{fontSize:'18px',color:COLORS[n%COLORS.length]}},String(n))); card.appendChild(tallyCard(n)); }
+        else { card.appendChild(MM.el('div',{class:'nd-num',style:{fontSize:'18px',color:COLORS[n%COLORS.length]}},String(n))); card.appendChild(frameCard(n)); }
+        grid.appendChild(card);
+      }
+    }
+    const pill = (id,label) => MM.el('button',{class:'mm-pill','aria-pressed':style===id, onClick:(e)=>{ style=id; MM.sound.play('click'); [...pills.children].forEach(c=>c.setAttribute('aria-pressed', c===e.currentTarget)); render(); }}, label);
+    const pills = MM.el('div',{class:'mm-pills noprint'});
+    pills.append(pill('dots','● Dots'), pill('tally','丨 Tally'), pill('numerals','7 Numbers'), pill('frame','⬛ Ten-Frames'));
+
+    const panel = MM.el('div',{class:'mm-panel mm-bounce-in'},
+      MM.el('div',{class:'mm-center noprint', style:{marginBottom:'6px'}}, MM.el('p',{class:'mm-hint'}, 'Pick a card style, then print your deck!')),
+      pills,
+      MM.el('div',{class:'mm-row noprint', style:{marginTop:'12px'}}, MM.el('button',{class:'mm-btn green', onClick:()=>{ MM.sound.play('ding'); window.print(); }}, '🖨️ Print my deck')),
+      grid
+    );
+    mount.appendChild(panel);
+    render();
+  }
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,530 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Hexagon vs Triangle</title>
+<link rel="stylesheet" href="../../assets/common.css">
+</head>
+<body>
+<script src="../../assets/common.js"></script>
+<script>
+/* HEXAGON vs TRIANGLE — 7 gold coins share one hex board.
+   One player wins by arranging 6 coins into a TRIANGLE; the other by a HEXAGON ring.
+   On a turn: MOVE a coin to an adjacent empty space, OR JUMP a coin over an adjacent
+   coin into the empty space directly beyond (in a straight line). First to build THEIR
+   6-coin target shape (anywhere on the board) wins. Goals swap on rematch.
+
+   BOARD: 13 cells on a triangular/hex grid, rows of 3,4,3,3 laid on a hex lattice so
+   every cell has up to 6 neighbours. Adjacency & straight-line jumps are computed from
+   unit coordinates (like Troll Hole). 7 coins => 6 empty spaces to maneuver.
+
+   TARGET SHAPES (defined as sets of relative axial offsets; a shape matches if some
+   translation of it is fully covered by coins):
+     TRIANGLE  = a size-3 triangle of 6 cells (rows of 1,2,3).
+     HEXAGON   = 6 cells forming a ring around a centre (the 6 neighbours of a cell).
+
+   AI: BFS over board states gives each player's true distance-to-their-goal (min moves
+   to complete their shape ignoring the opponent). The AI plays the move that minimises
+   its OWN distance; ties broken by (a) not handing the opponent a 1-move win, then
+   (b) increasing the opponent's distance. "Smart" also avoids losing outright. */
+
+const GOLD = '🪙';
+
+/* ---------------- board geometry (axial hex coords q,r) ----------------
+   Use offset rows so each cell maps to axial (q,r). Neighbours in axial hex:
+   (+1,0)(-1,0)(0,+1)(0,-1)(+1,-1)(-1,+1). */
+const HEXDIRS = [[1,0],[-1,0],[0,1],[0,-1],[1,-1],[-1,1]];
+
+// Build a radius-2 hexagonal board: all axial cells with |q|,|r|,|q+r| <= 2 => 19 cells.
+// This roomy, perfectly symmetric hex gives 12 triangle spots + 7 hexagon spots to aim at.
+const AXIAL = [];
+{
+  const RAD = 2;
+  for (let q = -RAD; q <= RAD; q++)
+    for (let r = -RAD; r <= RAD; r++)
+      if (Math.abs(-q - r) <= RAD) AXIAL.push([q, r]);
+}
+const NC = AXIAL.length;                       // 19
+const key = (q,r) => q + ',' + r;
+const AX_INDEX = {};
+AXIAL.forEach((c,i) => AX_INDEX[key(c[0],c[1])] = i);
+
+// pixel-ish layout for rendering (pointy-top hex -> x,y)
+function axialToXY(q, r) { return [q + r/2, r * 0.87]; }
+const XY = AXIAL.map(([q,r]) => axialToXY(q,r));
+
+// neighbour index list per cell
+const NBR = AXIAL.map(([q,r]) =>
+  HEXDIRS.map(([dq,dr]) => AX_INDEX[key(q+dq, r+dr)]).filter(i => i !== undefined)
+);
+// jump table: for cell a over neighbour m in a straight line -> landing cell b (index or -1)
+// jump[a] = array of {over, to} pairs where 'to' is the cell beyond 'over' in same direction.
+const JUMP = AXIAL.map(([q,r]) => {
+  const out = [];
+  for (const [dq,dr] of HEXDIRS) {
+    const mid = AX_INDEX[key(q+dq, r+dr)];
+    const land = AX_INDEX[key(q+2*dq, r+2*dr)];
+    if (mid !== undefined && land !== undefined) out.push({ over: mid, to: land });
+  }
+  return out;
+});
+
+/* ------------- target shapes as axial offset sets (canonical) ------------- */
+// TRIANGLE: size-3 up-triangle, 6 cells.
+const TRI_SHAPE = [[0,0],[1,0],[2,0],[0,1],[1,1],[0,2]];
+// HEXAGON: the 6 neighbours around an origin (ring of 6).
+const HEX_SHAPE = HEXDIRS.map(d => [d[0], d[1]]);
+
+// Enumerate every placement (as a Set of board-cell indices) of a shape that fits fully
+// on the board, considering all 6 hex rotations + reflection for triangles, rotations for hex.
+function rot60(q, r) { return [ -r, q + r ]; }           // 60° axial rotation
+function reflect(q, r) { return [ q + r, -r ]; }         // a reflection
+function shapeVariants(shape, withReflect) {
+  const variants = [];
+  const seen = new Set();
+  let cur = shape.map(c => c.slice());
+  for (let ref = 0; ref < (withReflect ? 2 : 1); ref++) {
+    let s = cur.map(c => c.slice());
+    for (let rot = 0; rot < 6; rot++) {
+      const norm = s.map(c => c.slice());
+      const skey = JSON.stringify(norm.map(c => c.join(',')).sort());
+      if (!seen.has(skey)) { seen.add(skey); variants.push(norm.map(c => c.slice())); }
+      s = s.map(([q,r]) => rot60(q,r));
+    }
+    cur = cur.map(([q,r]) => reflect(q,r));
+  }
+  return variants;
+}
+function placementsFor(shape, withReflect) {
+  const vars = shapeVariants(shape, withReflect);
+  const places = [];
+  const seenSets = new Set();
+  for (const v of vars) {
+    for (const [bq, br] of AXIAL) {
+      // try anchoring shape's first cell at each board cell
+      for (const [aq, ar] of v) {
+        const dq = bq - aq, dr = br - ar;
+        const idxs = [];
+        let ok = true;
+        for (const [q, r] of v) {
+          const i = AX_INDEX[key(q + dq, r + dr)];
+          if (i === undefined) { ok = false; break; }
+          idxs.push(i);
+        }
+        if (!ok) continue;
+        idxs.sort((a,b)=>a-b);
+        const sk = idxs.join(',');
+        if (seenSets.has(sk)) continue;
+        seenSets.add(sk);
+        places.push(idxs);
+      }
+    }
+  }
+  return places;
+}
+const GOAL_PLACES = {
+  tri: placementsFor(TRI_SHAPE, true),
+  hex: placementsFor(HEX_SHAPE, false),
+};
+
+/* ---- board state helpers: state = 13-length array, true = coin present ---- */
+const NCOINS = 7;
+function coinsSet(state) { const s = new Set(); for (let i=0;i<NC;i++) if (state[i]) s.add(i); return s; }
+function isGoal(state, goal) {
+  for (const pl of GOAL_PLACES[goal]) { if (pl.every(i => state[i])) return true; }
+  return false;
+}
+// all legal (from,to,type) moves from a state
+function movesFrom(state) {
+  const mv = [];
+  for (let a = 0; a < NC; a++) {
+    if (!state[a]) continue;
+    for (const b of NBR[a]) if (!state[b]) mv.push({ from:a, to:b, jump:false });
+    for (const { over, to } of JUMP[a]) if (state[over] && !state[to]) mv.push({ from:a, to, jump:true });
+  }
+  return mv;
+}
+function applyMove(state, m) { const s = state.slice(); s[m.from] = false; s[m.to] = true; return s; }
+function stateKey(state) { let k=''; for (let i=0;i<NC;i++) k += state[i] ? '1':'0'; return k; }
+
+/* BFS: minimum number of moves for the given side to reach ITS goal, ignoring opponent.
+   Capped depth so it stays fast; returns Infinity if not found within cap. */
+function distanceToGoal(state, goal, cap) {
+  cap = cap || 8;
+  if (isGoal(state, goal)) return 0;
+  const seen = new Set([stateKey(state)]);
+  let frontier = [state];
+  for (let d = 1; d <= cap; d++) {
+    const next = [];
+    for (const st of frontier) {
+      for (const m of movesFrom(st)) {
+        const ns = applyMove(st, m);
+        const k = stateKey(ns);
+        if (seen.has(k)) continue;
+        if (isGoal(ns, goal)) return d;
+        seen.add(k);
+        next.push(ns);
+      }
+    }
+    frontier = next;
+    if (frontier.length === 0) break;
+    if (seen.size > 60000) break;           // safety budget
+  }
+  return Infinity;
+}
+
+const HEXC = { tri: '#ff9f1c', hex: '#8338ec' };   // accent per role (label colours)
+
+MM.game({
+  title: 'Hexagon vs Triangle', emoji: '🪙',
+  ba: 'https://beastacademy.com/playground/hexagon-vs-triangle',
+  rules: `
+    <p><b>Slide the coins to build YOUR shape!</b> Seven gold coins ${GOLD} share one board.
+    One player is <b>Team Triangle 🔺</b>, the other is <b>Team Hexagon ⬡</b>.</p>
+    <ol>
+      <li>On your turn, either <b>slide</b> one coin into a touching empty space,
+          <b>or jump</b> a coin over a neighbour into the empty space right beyond it.</li>
+      <li><b>Team Triangle</b> wins by getting 6 coins into a <b>triangle</b> 🔺.</li>
+      <li><b>Team Hexagon</b> wins by getting 6 coins into a <b>ring of 6</b> ⬡ (a hexagon).</li>
+      <li>First team to build their shape <b>anywhere</b> on the board <b>wins</b>! 🎉</li>
+    </ol>
+    <p>The little pictures below the board show exactly what each shape looks like.
+    On a rematch the teams <b>swap goals</b>, so everyone gets a turn at each shape.</p>`,
+  modes: [
+    { id: 'ai',  emoji: '🤖', name: 'Vs Computer', sub: 'You pick your shape' },
+    { id: 'two', emoji: '🧑‍🤝‍🧑', name: '2 Players', sub: 'Pass & play' },
+  ],
+  onStart,
+});
+
+function onStart(mode, mount) {
+  const vsAI = mode === 'ai';
+  let hard = MM.load('hvt-hard', true);
+  // persistent role/swap across rematches within a session
+  let humanGoal = MM.load('hvt-role', 'tri');    // for AI mode: which shape the human plays
+  let swapCount = 0;
+
+  // Roles for the round: player 1 and player 2 goals (they are the two shapes).
+  let goalOf;              // {1:'tri'|'hex', 2:...}
+  let turn, state, over, busy, sel;
+  const AI = 2;            // in AI mode the computer is player 2
+
+  const size = Math.min(460, window.innerWidth - 28);
+  const svgNS = 'http://www.w3.org/2000/svg';
+
+  const panel = MM.el('div', { class: 'mm-panel mm-center mm-bounce-in' });
+
+  // ---- option pills row (role + difficulty) ----
+  const optRow = MM.el('div', { class: 'mm-pills', style: { marginBottom: '10px' } });
+
+  const svg = document.createElementNS(svgNS, 'svg');
+  const xs = XY.map(p=>p[0]), ys = XY.map(p=>p[1]);
+  const minX = Math.min(...xs), maxX = Math.max(...xs), minY = Math.min(...ys), maxY = Math.max(...ys);
+  const pad = 0.8;
+  svg.setAttribute('viewBox', `${minX-pad} ${minY-pad} ${(maxX-minX)+pad*2} ${(maxY-minY)+pad*2}`);
+  svg.style.width = size + 'px'; svg.style.maxWidth = '100%'; svg.style.height = 'auto';
+  svg.style.display = 'block'; svg.style.margin = '6px auto'; svg.style.touchAction = 'manipulation';
+
+  const legend = MM.el('div', { class: 'hvt-legend' });
+  const hint = MM.el('div', { class: 'mm-hint' });
+
+  panel.append(optRow, svg, legend, hint);
+  mount.appendChild(panel);
+
+  const R = 0.40;
+
+  function buildPills() {
+    optRow.innerHTML = '';
+    if (vsAI) {
+      optRow.appendChild(MM.el('span', { class: 'hvt-lbl' }, 'You are:'));
+      [['tri','🔺 Triangle'], ['hex','⬡ Hexagon']].forEach(([g,name]) => {
+        optRow.appendChild(MM.el('button', {
+          class: 'mm-pill', 'aria-pressed': String(g === humanGoal),
+          onClick: () => { if (busy) return; MM.sound.play('click'); humanGoal = g; MM.store('hvt-role', g); swapCount = 0; buildPills(); reset(); },
+        }, name));
+      });
+      optRow.appendChild(MM.el('span', { class: 'hvt-lbl', style:{marginLeft:'6px'} }, 'Robot:'));
+      [['Easy', false, '🐣'], ['Smart', true, '🧠']].forEach(([name, val, em]) => {
+        optRow.appendChild(MM.el('button', {
+          class: 'mm-pill', 'aria-pressed': String(val === hard),
+          onClick: () => { if (busy) return; MM.sound.play('click'); hard = val; MM.store('hvt-hard', val); buildPills(); },
+        }, em + ' ' + name));
+      });
+    } else {
+      optRow.appendChild(MM.el('span', { class: 'hvt-lbl' }, 'Round starts:'));
+      const nm = MM.el('span', { style: { fontWeight:'800' } }, 'P1 🔺 · P2 ⬡');
+      optRow.appendChild(nm);
+    }
+  }
+
+  // ---- rendering ----
+  function goalPlaceHighlight() {
+    // if the current player is one move from THEIR goal, gently show a target set (hint)
+    return null;
+  }
+
+  function render() {
+    svg.innerHTML = '';
+    // draw faint connectors between neighbours so the lattice reads as a board
+    const drawn = new Set();
+    for (let a=0;a<NC;a++) for (const b of NBR[a]) {
+      const kk = Math.min(a,b)+'-'+Math.max(a,b);
+      if (drawn.has(kk)) continue; drawn.add(kk);
+      const ln = document.createElementNS(svgNS,'line');
+      ln.setAttribute('x1', XY[a][0]); ln.setAttribute('y1', XY[a][1]);
+      ln.setAttribute('x2', XY[b][0]); ln.setAttribute('y2', XY[b][1]);
+      ln.setAttribute('stroke', '#efe7d8'); ln.setAttribute('stroke-width', 0.07);
+      ln.setAttribute('stroke-linecap','round');
+      svg.appendChild(ln);
+    }
+    // legal destinations for the selected coin
+    const dests = {};
+    if (sel != null) for (const m of movesFrom(state)) if (m.from === sel) dests[m.to] = m;
+
+    for (let i=0;i<NC;i++) {
+      const [x,y] = XY[i];
+      const g = document.createElementNS(svgNS,'g');
+      const circ = document.createElementNS(svgNS,'circle');
+      circ.setAttribute('cx', x); circ.setAttribute('cy', y); circ.setAttribute('r', R);
+      let fill = '#fffdf6', stroke = '#e2d8c6', sw = 0.06;
+      if (dests[i]) { fill = '#eafff9'; stroke = '#2ec4b6'; sw = 0.11; }
+      if (sel === i) { stroke = '#ffd23f'; sw = 0.14; }
+      circ.setAttribute('fill', fill); circ.setAttribute('stroke', stroke); circ.setAttribute('stroke-width', sw);
+      const clickable = !over && !busy;
+      if (clickable) { circ.style.cursor = 'pointer'; circ.addEventListener('click', () => cellClick(i)); }
+      g.appendChild(circ);
+      if (state[i]) {
+        const t = document.createElementNS(svgNS,'text');
+        t.setAttribute('x', x); t.setAttribute('y', y + 0.02);
+        t.setAttribute('text-anchor','middle'); t.setAttribute('dominant-baseline','central');
+        t.setAttribute('font-size', 0.52);
+        t.textContent = GOLD;
+        if (clickable) { t.style.cursor='pointer'; t.addEventListener('click', () => cellClick(i)); }
+        if (sel === i) t.setAttribute('class','hvt-selcoin');
+        g.appendChild(t);
+      } else if (dests[i]) {
+        const dot = document.createElementNS(svgNS,'circle');
+        dot.setAttribute('cx',x); dot.setAttribute('cy',y); dot.setAttribute('r',0.11);
+        dot.setAttribute('fill','#2ec4b6');
+        if (clickable){ dot.style.cursor='pointer'; dot.addEventListener('click',()=>cellClick(i)); }
+        g.appendChild(dot);
+      }
+      svg.appendChild(g);
+    }
+    buildLegend();
+    statusUpdate();
+  }
+
+  // mini SVG diagram of a target shape for the legend. For the hexagon we also draw a
+  // hollow centre so kids clearly see it's a RING of 6 around a middle space.
+  function miniShape(shape, color, hollowCentre) {
+    const s = 64;
+    const ns = 'http://www.w3.org/2000/svg';
+    const el = document.createElementNS(ns,'svg');
+    const pts = shape.map(([q,r]) => axialToXY(q,r));
+    const extra = hollowCentre ? [axialToXY(0,0)] : [];
+    const allPts = pts.concat(extra);
+    const xs = allPts.map(p=>p[0]), ys = allPts.map(p=>p[1]);
+    const mnx=Math.min(...xs), mxx=Math.max(...xs), mny=Math.min(...ys), mxy=Math.max(...ys);
+    const pd=0.55;
+    el.setAttribute('viewBox', `${mnx-pd} ${mny-pd} ${(mxx-mnx)+pd*2} ${(mxy-mny)+pd*2}`);
+    el.setAttribute('width', s); el.setAttribute('height', s);
+    if (hollowCentre) {
+      const [cx,cy] = axialToXY(0,0);
+      const c = document.createElementNS(ns,'circle');
+      c.setAttribute('cx',cx); c.setAttribute('cy',cy); c.setAttribute('r',0.30);
+      c.setAttribute('fill','#fff'); c.setAttribute('stroke','#e2d8c6'); c.setAttribute('stroke-width',0.07);
+      el.appendChild(c);
+    }
+    for (const [x,y] of pts) {
+      const c = document.createElementNS(ns,'circle');
+      c.setAttribute('cx',x); c.setAttribute('cy',y); c.setAttribute('r',0.34);
+      c.setAttribute('fill', color); c.setAttribute('stroke','#fff'); c.setAttribute('stroke-width',0.06);
+      el.appendChild(c);
+    }
+    return el;
+  }
+
+  function buildLegend() {
+    legend.innerHTML = '';
+    const rows = [
+      { goal:'tri', emoji:'🔺', name:'Triangle', shape: TRI_SHAPE, color:'#ff9f1c' },
+      { goal:'hex', emoji:'⬡', name:'Hexagon',  shape: HEX_SHAPE, color:'#8338ec' },
+    ];
+    for (const r of rows) {
+      const whoLabel = playerForGoal(r.goal);
+      const box = MM.el('div', { class: 'hvt-goal' + (turn===playerNumForGoal(r.goal) && !over ? ' active':'') });
+      box.appendChild(miniShape(r.shape, r.color, r.goal === 'hex'));
+      const cap = MM.el('div', { class:'hvt-cap' },
+        MM.el('div', { class:'hvt-name', style:{color:r.color} }, r.emoji + ' ' + r.name),
+        MM.el('div', { class:'hvt-who' }, whoLabel));
+      box.appendChild(cap);
+      legend.appendChild(box);
+    }
+  }
+  function playerNumForGoal(goal) { return goalOf[1] === goal ? 1 : 2; }
+  function playerForGoal(goal) {
+    const pn = playerNumForGoal(goal);
+    if (vsAI) return pn === AI ? '🤖 Computer' : '🧒 You';
+    return 'Player ' + pn;
+  }
+
+  function statusUpdate() {
+    if (over) return;
+    const myGoal = goalOf[turn];
+    const emoji = myGoal === 'tri' ? '🔺' : '⬡';
+    const who = vsAI ? (turn===AI ? '🤖 Computer…' : '🧒 Your turn') : ('Player ' + turn);
+    MM.status(`<span class="chip" style="background:${HEXC[myGoal]}">${who} — build ${emoji}</span>`);
+    if (vsAI && turn === AI) hint.textContent = 'The computer is sliding a coin…';
+    else if (sel != null) hint.textContent = 'Now tap a glowing space to move there, or tap the coin again to cancel.';
+    else hint.textContent = 'Tap one of your coins, then a glowing space.';
+  }
+
+  // ---- interaction ----
+  function cellClick(i) {
+    if (over || busy) return;
+    if (vsAI && turn === AI) return;
+    if (sel == null) {
+      if (state[i]) { sel = i; MM.sound.play('click'); render(); }
+      return;
+    }
+    if (i === sel) { sel = null; MM.sound.play('click'); render(); return; }
+    // is i a legal destination?
+    const m = movesFrom(state).find(mm => mm.from === sel && mm.to === i);
+    if (m) { doMove(m); return; }
+    // clicked another coin -> reselect
+    if (state[i]) { sel = i; MM.sound.play('click'); render(); return; }
+    // illegal empty
+    MM.sound.play('wrong');
+  }
+
+  function doMove(m) {
+    sel = null;
+    state = applyMove(state, m);
+    MM.sound.play(m.jump ? 'pop' : 'place');
+    render();
+    if (isGoal(state, goalOf[turn])) { finish(turn); return; }
+    turn = turn === 1 ? 2 : 1;
+    render();
+    if (vsAI && turn === AI && !over) { busy = true; statusUpdate(); setTimeout(aiTurn, 520); }
+  }
+
+  // ---- AI ----
+  function aiTurn() {
+    if (over) return;
+    const myGoal = goalOf[AI], oppGoal = goalOf[AI===1?2:1];
+    const moves = movesFrom(state);
+    // Easy: sometimes random among moves that at least don't lose immediately if possible.
+    if (!hard && Math.random() < 0.5) {
+      const nonLosing = moves.filter(m => {
+        const ns = applyMove(state, m);
+        if (isGoal(ns, myGoal)) return true;                 // winning move is great
+        return !oppHasImmediateWin(ns, oppGoal);
+      });
+      const pool = nonLosing.length ? nonLosing : moves;
+      finishAiMove(MM.choice(pool));
+      return;
+    }
+    // Smart: minimise my distance-to-goal; strong tie-breaks.
+    let best = null, bestScore = null;
+    for (const m of MM.shuffle(moves.slice())) {
+      const ns = applyMove(state, m);
+      if (isGoal(ns, myGoal)) { best = m; break; }            // instant win
+      // avoid giving opponent an instant win
+      const givesWin = oppHasImmediateWin(ns, oppGoal) ? 1 : 0;
+      const myDist = distanceToGoal(ns, myGoal, 7);
+      const oppDist = distanceToGoal(ns, oppGoal, 6);
+      // score: lower is better -> [givesWin, myDist, -oppDist]
+      const score = givesWin * 1000 + myDist * 10 - Math.min(oppDist, 9);
+      if (bestScore === null || score < bestScore) { bestScore = score; best = m; }
+    }
+    finishAiMove(best || MM.choice(moves));
+  }
+  function oppHasImmediateWin(st, oppGoal) {
+    for (const m of movesFrom(st)) if (isGoal(applyMove(st, m), oppGoal)) return true;
+    return false;
+  }
+  function finishAiMove(m) {
+    sel = null;
+    state = applyMove(state, m);
+    MM.sound.play(m.jump ? 'pop' : 'place');
+    busy = false;
+    render();
+    if (isGoal(state, goalOf[AI])) { finish(AI); return; }
+    turn = turn === 1 ? 2 : 1;
+    render();
+  }
+
+  function finish(winnerPlayer) {
+    over = true; busy = false; sel = null;
+    render();
+    const g = goalOf[winnerPlayer];
+    const emoji = g === 'tri' ? '🔺' : '⬡';
+    const shapeName = g === 'tri' ? 'Triangle' : 'Hexagon';
+    if (vsAI) {
+      const youWin = winnerPlayer !== AI;
+      MM.win({ lose: !youWin,
+        title: youWin ? 'You win! 🎉' : 'Computer wins!',
+        emoji: youWin ? '🏆' : '🤖',
+        sub: (youWin ? 'You' : 'The computer') + ' built the ' + shapeName + ' ' + emoji + '!',
+        onAgain: rematch });
+    } else {
+      MM.win({ title: 'Player ' + winnerPlayer + ' wins! 🎉', emoji,
+        sub: 'Built the ' + shapeName + ' ' + emoji + '!', onAgain: rematch });
+    }
+  }
+
+  // rematch swaps the goals so each side tries the other shape
+  function rematch() {
+    if (vsAI) { humanGoal = humanGoal === 'tri' ? 'hex' : 'tri'; MM.store('hvt-role', humanGoal); buildPills(); }
+    else { swapCount++; }
+    reset();
+  }
+
+  // Starting layout: a symmetric "flower" — the 6 mid-edge cells of the hexagon plus the
+  // centre. It is NOT already a triangle or hexagon, and sits a fair few moves (BFS-checked)
+  // from BOTH goals, so neither side has a head start.
+  const START_CELLS = (() => {
+    const coords = [[1,-2],[2,-1],[1,1],[-1,2],[-2,1],[-1,-1],[0,0]];
+    return coords.map(([q,r]) => AX_INDEX[key(q,r)]).filter(i => i !== undefined);
+  })();
+
+  function reset() {
+    state = Array(NC).fill(false);
+    for (const i of START_CELLS) state[i] = true;
+    turn = 1; over = false; busy = false; sel = null;
+    // assign goals for this round
+    if (vsAI) { goalOf = { [AI===1?2:1]: humanGoal, [AI]: humanGoal === 'tri' ? 'hex' : 'tri' }; }
+    else {
+      // players 1&2; swap each rematch so both try each shape
+      const base = swapCount % 2 === 0 ? { 1:'tri', 2:'hex' } : { 1:'hex', 2:'tri' };
+      goalOf = base;
+    }
+    render();
+    if (vsAI && turn === AI && !over) { busy = true; statusUpdate(); setTimeout(aiTurn, 500); }
+  }
+
+  buildPills();
+  reset();
+}
+</script>
+<style>
+  .hvt-lbl { font-weight: 800; align-self: center; color: var(--ink-soft); font-size: 15px; }
+  .hvt-legend { display: flex; gap: 14px; justify-content: center; flex-wrap: wrap; margin: 6px 0 2px; }
+  .hvt-goal {
+    display: flex; align-items: center; gap: 10px; padding: 8px 14px;
+    background: #fff; border-radius: 16px; box-shadow: 0 4px 0 #e7e0d0;
+    border: 3px solid transparent;
+  }
+  .hvt-goal.active { border-color: var(--c-yellow); }
+  .hvt-goal svg { display: block; }
+  .hvt-cap { text-align: left; }
+  .hvt-name { font-weight: 800; font-size: 16px; }
+  .hvt-who { font-size: 13px; color: var(--ink-soft); }
+  .hvt-selcoin { animation: hvtwob 0.7s ease-in-out infinite; transform-box: fill-box; transform-origin: center; }
+  @keyframes hvtwob { 0%,100%{ transform: translateY(-0.02px) } 50%{ transform: translateY(0.04px) } }
+  svg text { pointer-events: auto; user-select: none; }
+</style>
+</body>
+</html>

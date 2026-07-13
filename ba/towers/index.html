@@ -1,0 +1,362 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Towers</title>
+<link rel="stylesheet" href="../../assets/common.css">
+</head>
+<body>
+<script src="../../assets/common.js"></script>
+<script>
+/* TOWERS — a cheerful chance race (no real AI, no decisions).
+   Each player has 5 tower bases (number cards 1–10, all different per player).
+   A shared draw pile is flipped one card at a time. Whenever a flipped number
+   matches one of your bases, stack ONE block on that tower (each tower needs
+   just one block). First player to put a block on ALL FIVE towers wins.
+   Modes:
+     - ai:   you vs the computer (both race; a flip advances every matching tower).
+     - two:  side-by-side, both watch the same flips.
+     - solo: build your own 5 towers; count how many flips it took (best via store). */
+
+const HEX = { 1: '#3a86ff', 2: '#ff5a5f' };
+const BLOCK_EMOJI = ['🟥', '🟧', '🟨', '🟩', '🟦'];
+const TOWER_COLORS = ['#ff5a5f', '#ff9f1c', '#ffd23f', '#2ec4b6', '#3a86ff'];
+
+MM.game({
+  title: 'Towers', emoji: '🏗️',
+  ba: 'https://beastacademy.com/playground/towers',
+  rules: `
+    <p><b>Build all five towers!</b> Each player has <b>5 number cards</b> — those are your tower bases. 🧱</p>
+    <ol>
+      <li>Tap <b>Flip! 🎴</b> to turn over the top card of the shared pile.</li>
+      <li>If the flipped number matches one of <b>your</b> bases, a block <b>stacks</b> on that tower! 🎉</li>
+      <li>The first player to put a block on <b>all five towers</b> wins! 🏆</li>
+    </ol>
+    <p>It's a <b>race of luck</b> — perfect for little builders. Count along as the blocks stack up! 🔢</p>`,
+  modes: [
+    { id: 'ai',   emoji: '🤖', name: 'Vs Computer', sub: 'Race the robot' },
+    { id: 'two',  emoji: '🧑‍🤝‍🧑', name: '2 Players', sub: 'Side by side' },
+    { id: 'solo', emoji: '🧒', name: 'Just Me', sub: 'Beat your best' },
+  ],
+  onStart,
+});
+
+function onStart(mode, mount) {
+  const isSolo = mode === 'solo';
+  const isAI = mode === 'ai';
+  const isTwo = mode === 'two';
+  const twoSided = isAI || isTwo; // two players' towers on screen
+
+  // State (set up in newGame()).
+  let bases = { 1: [], 2: [] };   // arrays of 5 distinct numbers (1..10)
+  let built = { 1: [], 2: [] };   // booleans, block placed?
+  let deck = [];
+  let deckPos = 0;
+  let flips = 0;
+  let over = false;
+  let flipping = false;
+  let autoOn = false;
+  let autoTimer = null;
+
+  // DOM refs
+  const panel = MM.el('div', { class: 'mm-panel mm-center mm-bounce-in' });
+  mount.appendChild(panel);
+  let towerEls = { 1: [], 2: [] }; // per tower: { wrap, stack, label }
+  let flipCard, flipBtn, autoBtn, deckCountEl;
+
+  /* ---------------------------------------------------- deck helpers */
+  function pickBases() {
+    // 5 distinct numbers 1..10 for each player.
+    bases[1] = MM.shuffle([1,2,3,4,5,6,7,8,9,10]).slice(0, 5);
+    if (twoSided) bases[2] = MM.shuffle([1,2,3,4,5,6,7,8,9,10]).slice(0, 5);
+    built[1] = [false, false, false, false, false];
+    built[2] = [false, false, false, false, false];
+  }
+  function buildDeck() {
+    // A generous draw pile: several of each number 1..10 so towers fill up.
+    // 6 copies of each = 60 cards, plenty for a full race.
+    deck = [];
+    for (let n = 1; n <= 10; n++) for (let k = 0; k < 6; k++) deck.push(n);
+    MM.shuffle(deck);
+    deckPos = 0;
+  }
+
+  /* ---------------------------------------------------- new game */
+  function newGame() {
+    pickBases();
+    buildDeck();
+    flips = 0; over = false; flipping = false; autoOn = false;
+    if (autoTimer) { clearTimeout(autoTimer); autoTimer = null; }
+    render();
+    status();
+  }
+
+  /* ---------------------------------------------------- render */
+  function towerColumn(player, idx) {
+    const col = TOWER_COLORS[idx];
+    const stack = MM.el('div', {
+      style: {
+        display: 'flex', flexDirection: 'column-reverse', alignItems: 'center',
+        minHeight: '46px', justifyContent: 'flex-start', gap: '2px',
+      },
+    });
+    // base card
+    const base = MM.el('div', {
+      style: {
+        width: '46px', minHeight: '46px', borderRadius: '12px',
+        background: '#fff', border: '4px solid ' + col, color: col,
+        fontWeight: '800', fontSize: '24px', display: 'flex',
+        alignItems: 'center', justifyContent: 'center', boxShadow: '0 4px 0 rgba(0,0,0,.14)',
+      },
+    }, String(bases[player][idx]));
+    const wrap = MM.el('div', { style: { display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '4px' } },
+      stack, base);
+    towerEls[player][idx] = { wrap, stack, base };
+    return wrap;
+  }
+
+  function playerSide(player) {
+    const name = isSolo ? '🧒 Your towers' : (isAI ? (player === 1 ? '🧒 You' : '🤖 Robot') : ('🧒 Player ' + player));
+    const header = MM.el('div', {
+      style: { fontWeight: '800', fontSize: '18px', color: HEX[player], marginBottom: '6px' },
+    }, name + ' — ' + builtCount(player) + '/5');
+    header.dataset.player = String(player);
+    header.dataset.role = 'header';
+    const row = MM.el('div', {
+      style: { display: 'flex', gap: '8px', justifyContent: 'center', flexWrap: 'wrap' },
+    });
+    for (let i = 0; i < 5; i++) row.appendChild(towerColumn(player, i));
+    return MM.el('div', {
+      style: {
+        background: '#fbf7ff', border: '3px solid ' + HEX[player] + '55',
+        borderRadius: '18px', padding: '12px 10px', margin: '6px auto', maxWidth: '460px',
+      },
+    }, header, row);
+  }
+
+  function render() {
+    panel.innerHTML = '';
+    towerEls = { 1: [], 2: [] };
+
+    // flip card + big flip button + auto toggle
+    flipCard = MM.el('div', {
+      style: {
+        width: '84px', height: '108px', borderRadius: '16px', margin: '4px auto 10px',
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+        fontWeight: '800', fontSize: '46px', color: '#fff',
+        background: 'repeating-linear-gradient(45deg, #8338ec, #8338ec 10px, #7a2fe0 10px, #7a2fe0 20px)',
+        boxShadow: '0 6px 0 rgba(0,0,0,.18)', transition: 'transform .15s ease',
+      },
+    }, '🎴');
+
+    deckCountEl = MM.el('div', { class: 'mm-hint', style: { marginTop: '0' } }, deckLeftText());
+
+    panel.appendChild(flipCard);
+    panel.appendChild(deckCountEl);
+
+    flipBtn = MM.el('button', {
+      class: 'mm-btn', style: {
+        fontSize: '22px', padding: '16px 34px', minHeight: '58px', background: '#8338ec',
+      },
+      onClick: () => { MM.sound.play('click'); flipOnce(); },
+    }, 'Flip! 🎴');
+
+    autoBtn = MM.el('button', {
+      class: 'mm-btn ghost', style: { fontSize: '18px', padding: '14px 22px', minHeight: '58px' },
+      onClick: toggleAuto,
+    }, '▶️ Auto play');
+
+    panel.appendChild(MM.el('div', { class: 'mm-row', style: { marginBottom: '12px' } }, flipBtn, autoBtn));
+
+    // player sides
+    panel.appendChild(playerSide(1));
+    if (twoSided) panel.appendChild(playerSide(2));
+
+    // paint any pre-built blocks (fresh game => none)
+    for (let p = 1; p <= (twoSided ? 2 : 1); p++)
+      for (let i = 0; i < 5; i++) if (built[p][i]) placeBlockInstant(p, i);
+  }
+
+  function deckLeftText() { return '🃏 Cards left: ' + (deck.length - deckPos); }
+  function builtCount(p) { return built[p].filter(Boolean).length; }
+
+  function refreshHeaders() {
+    panel.querySelectorAll('[data-role="header"]').forEach(h => {
+      const p = Number(h.dataset.player);
+      const name = isSolo ? '🧒 Your towers' : (isAI ? (p === 1 ? '🧒 You' : '🤖 Robot') : ('🧒 Player ' + p));
+      h.textContent = name + ' — ' + builtCount(p) + '/5';
+    });
+    if (deckCountEl) deckCountEl.textContent = deckLeftText();
+  }
+
+  /* ---------------------------------------------------- blocks */
+  function makeBlock(idx) {
+    return MM.el('div', {
+      style: {
+        width: '40px', height: '22px', borderRadius: '8px',
+        background: TOWER_COLORS[idx], boxShadow: '0 3px 0 rgba(0,0,0,.18)',
+        display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '14px', color: '#fff',
+      },
+    }, '🧱');
+  }
+  function placeBlockInstant(player, idx) {
+    const t = towerEls[player][idx];
+    if (!t) return;
+    if (t.stack.childElementCount === 0) t.stack.appendChild(makeBlock(idx));
+  }
+  function placeBlockBounce(player, idx) {
+    const t = towerEls[player][idx];
+    if (!t) return;
+    if (t.stack.childElementCount > 0) return;
+    const b = makeBlock(idx);
+    t.stack.appendChild(b);
+    if (b.animate) b.animate(
+      [{ transform: 'translateY(-26px) scale(1.3)', opacity: 0 },
+       { transform: 'translateY(4px) scale(1.05)', opacity: 1, offset: 0.7 },
+       { transform: 'translateY(0) scale(1)', opacity: 1 }],
+      { duration: 420, easing: 'cubic-bezier(.2,1.4,.4,1)' });
+    // base card glow
+    t.base.animate && t.base.animate(
+      [{ transform: 'scale(1)' }, { transform: 'scale(1.15)' }, { transform: 'scale(1)' }],
+      { duration: 320, easing: 'ease-out' });
+  }
+
+  /* ---------------------------------------------------- flip */
+  function nextCard() {
+    if (deckPos >= deck.length) { buildDeck(); } // reshuffle if we ever run out
+    return deck[deckPos++];
+  }
+
+  async function flipOnce() {
+    if (over || flipping) return;
+    flipping = true;
+    flipBtn.disabled = true;
+    const value = nextCard();
+    flips++;
+
+    // flip animation: shrink to edge, reveal number
+    MM.sound.play('deal');
+    if (flipCard.animate) {
+      flipCard.animate([{ transform: 'rotateY(0) scale(1)' }, { transform: 'rotateY(90deg) scale(1.05)' }],
+        { duration: 130, easing: 'ease-in', fill: 'forwards' });
+      await MM.sleep(130);
+    }
+    const col = numberColor(value);
+    flipCard.style.background = '#fff';
+    flipCard.style.color = col;
+    flipCard.style.boxShadow = '0 6px 0 rgba(0,0,0,.14), inset 0 0 0 5px ' + col;
+    flipCard.textContent = String(value);
+    if (flipCard.animate) {
+      flipCard.animate([{ transform: 'rotateY(90deg) scale(1.05)' }, { transform: 'rotateY(0) scale(1)' }],
+        { duration: 150, easing: 'ease-out' });
+    }
+    MM.sound.play('pop');
+    await MM.sleep(180);
+
+    // Advance every matching tower on both sides.
+    let anyMatch = false;
+    const players = twoSided ? [1, 2] : [1];
+    for (const p of players) {
+      for (let i = 0; i < 5; i++) {
+        if (!built[p][i] && bases[p][i] === value) {
+          built[p][i] = true;
+          placeBlockBounce(p, i);
+          MM.sound.play('ding');
+          anyMatch = true;
+          await MM.sleep(240);
+        }
+      }
+    }
+    if (!anyMatch) MM.sound.play('swoosh');
+    refreshHeaders();
+
+    // reset flip card back to a "deck" look for the next flip
+    resetFlipCard();
+
+    // check for a winner
+    const done1 = builtCount(1) === 5;
+    const done2 = twoSided && builtCount(2) === 5;
+    if (done1 || done2) { flipping = false; finish(done1, done2); return; }
+
+    flipping = false;
+    if (!over) flipBtn.disabled = false;
+    status();
+
+    // continue auto-play
+    if (autoOn && !over) autoTimer = setTimeout(() => flipOnce(), 520);
+  }
+
+  function resetFlipCard() {
+    flipCard.style.background = 'repeating-linear-gradient(45deg, #8338ec, #8338ec 10px, #7a2fe0 10px, #7a2fe0 20px)';
+    flipCard.style.color = '#fff';
+    flipCard.style.boxShadow = '0 6px 0 rgba(0,0,0,.18)';
+    flipCard.textContent = '🎴';
+  }
+
+  function numberColor(v) {
+    // color the flipped number like the tower it might match (by base list),
+    // else a neutral purple.
+    return TOWER_COLORS[(v - 1) % TOWER_COLORS.length];
+  }
+
+  function toggleAuto() {
+    if (over) return;
+    autoOn = !autoOn;
+    MM.sound.play('click');
+    autoBtn.textContent = autoOn ? '⏸️ Stop' : '▶️ Auto play';
+    autoBtn.classList.toggle('green', autoOn);
+    autoBtn.classList.toggle('ghost', !autoOn);
+    if (autoOn && !flipping) flipOnce();
+    if (!autoOn && autoTimer) { clearTimeout(autoTimer); autoTimer = null; }
+  }
+
+  /* ---------------------------------------------------- status + finish */
+  function status() {
+    if (over) return;
+    if (isSolo) {
+      MM.status('<span class="chip" style="background:' + HEX[1] + '">Flips: ' + flips + ' — build all 5!</span>');
+    } else if (isAI) {
+      MM.status('<span class="chip" style="background:#8338ec">You ' + builtCount(1) + '/5 · Robot ' + builtCount(2) + '/5</span>');
+    } else {
+      MM.status('<span class="chip" style="background:#8338ec">P1 ' + builtCount(1) + '/5 · P2 ' + builtCount(2) + '/5</span>');
+    }
+  }
+
+  function finish(done1, done2) {
+    over = true;
+    autoOn = false;
+    if (autoTimer) { clearTimeout(autoTimer); autoTimer = null; }
+    if (flipBtn) flipBtn.disabled = true;
+    if (autoBtn) { autoBtn.disabled = true; }
+
+    if (isSolo) {
+      const best = MM.load('towers-best', null);
+      const isBest = best == null || flips < best;
+      if (isBest) MM.store('towers-best', flips);
+      MM.win({ title: 'All towers built! 🎉', emoji: '🏗️',
+        sub: 'It took ' + flips + ' flips.' + (isBest ? ' 🏅 New best!' : (' Best: ' + best)),
+        onAgain: () => MM.toMenu() });
+      return;
+    }
+
+    if (isAI) {
+      // both could finish on the same flip → tie
+      if (done1 && done2) MM.win({ title: 'A tie! 🤝', emoji: '🤝', sub: 'You both finished together!', onAgain: () => MM.toMenu() });
+      else if (done1) MM.win({ title: 'You win! 🎉', emoji: '🏆', sub: 'You built all five towers first!', onAgain: () => MM.toMenu() });
+      else MM.win({ lose: true, title: 'Robot wins!', emoji: '🤖', sub: 'The robot finished first — try again!', onAgain: () => MM.toMenu() });
+    } else {
+      if (done1 && done2) MM.win({ title: 'A tie! 🤝', emoji: '🤝', sub: 'Both players finished together!', onAgain: () => MM.toMenu() });
+      else {
+        const w = done1 ? 1 : 2;
+        MM.win({ title: 'Player ' + w + ' wins! 🎉', emoji: w === 1 ? '🔵' : '🔴',
+          sub: 'Player ' + w + ' built all five towers first!', onAgain: () => MM.toMenu() });
+      }
+    }
+  }
+
+  newGame();
+}
+</script>
+</body>
+</html>

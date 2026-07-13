@@ -1,0 +1,259 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Candle Conundrum</title>
+<link rel="stylesheet" href="../../assets/common.css">
+</head>
+<body>
+<script src="../../assets/common.js"></script>
+<script>
+/* CANDLE CONUNDRUM — a "vanishing"/geometric illusion (missing-square family).
+   A row of candles is drawn. A SLANTED cut crosses every candle. Sliding the
+   bottom strip by exactly one candle-width re-joins tops to shifted bottoms.
+   Because the cut is slanted, the little wedge of height gets redistributed
+   across all candles — so a candle appears to change color and the counts
+   swap (e.g. 6 green + 5 blue  <->  5 green + 6 blue). Nothing is added or
+   removed: total candle "wax" is identical.
+
+   HONEST MODEL:
+   - There are N candle columns. Column i has full height H_i.
+   - The cut line has a gentle downward slope, so at column i the cut sits at
+     height cutBottom + i*step below the flame region.
+   - State A: top piece of column i sits directly on bottom piece of column i.
+     Colors: we choose so counts are (Gα, Bα).
+   - State B (slid): top piece of column i sits on bottom piece of column i+1
+     (bottoms shifted left by one). The slanted cut means the joined candle
+     heights still tile perfectly (the leftover bottom on the far side wraps to
+     become a short candle / the far top gains height) — and one candle's color
+     region flips, swapping the counts to (Gβ, Bβ) with Gα+Bα == Gβ+Bβ.
+   We render with Canvas so the cut-and-slide is crisp. */
+
+MM.game({
+  title: 'Candle Conundrum', emoji: '🕯️',
+  ba: 'https://beastacademy.com/playground/candle-conundrum',
+  rules: `
+    <p><b>The impossible candle trick!</b> 🕯️✨</p>
+    <p>Here is a row of candles — some green, some blue. A slanted <b>cut</b> goes across all of them.</p>
+    <p>When you <b>slide the bottom part over by one candle</b>, the bottoms line up under different tops. Suddenly it looks like one candle <b>changed color</b> — 6 green &amp; 5 blue turns into 5 green &amp; 6 blue!</p>
+    <p><b>How?</b> 🤔 Nothing was really added or taken away. The slanted cut means a tiny sliver of height gets shared out among <b>all</b> the candles. Each candle gets a little shorter or taller by a sliver you can barely see, and those slivers add up to exactly one whole candle. So no candle truly appears or disappears — the wax just gets rearranged!</p>
+    <p>Press <b>Slide the pieces</b> and watch the count change. Then slide it back! 🔀</p>`,
+  onStart,
+});
+
+function onStart(mode, mount) {
+  const N = 11;                 // number of candle columns
+  const W = Math.min(560, window.innerWidth - 28);
+  const H = Math.round(W * 0.72);
+  const dpr = window.devicePixelRatio || 1;
+
+  const panel = MM.el('div', { class: 'mm-panel mm-center mm-bounce-in' });
+
+  // live counts
+  const counts = MM.el('div', { class: 'mm-scorebar', style: { marginTop: '4px' } });
+  const scoreG = scoreChip('#2ec4b6', '🟢 Green');
+  const scoreB = scoreChip('#3a86ff', '🔵 Blue');
+  counts.append(scoreG.el, scoreB.el);
+
+  const cv = MM.el('canvas', { style: { width: W + 'px', height: H + 'px', maxWidth: '100%', display: 'block', margin: '8px auto', borderRadius: '16px', background: '#fffdf5', touchAction: 'manipulation' } });
+  cv.width = W * dpr; cv.height = H * dpr;
+  const g = cv.getContext('2d'); g.scale(dpr, dpr);
+
+  const caption = MM.el('div', { class: 'mm-hint', style: { fontSize:'17px', fontWeight:'800', minHeight:'1.4em', color:'#ff9f1c' } }, 'Count the candles… now slide! 🔀');
+
+  const btnSlide = MM.el('button', { class:'mm-btn pink', style:{ minHeight:'54px', fontSize:'18px' } }, '🔀 Slide the pieces');
+  const btnReset = MM.el('button', { class:'mm-btn ghost', style:{ minHeight:'48px' } }, '🔄 Reset');
+  const row = MM.el('div', { class:'mm-row', style:{ marginTop:'12px' } }, btnSlide, btnReset);
+
+  panel.append(counts, cv, caption, row);
+  mount.appendChild(panel);
+  MM.status('<span class="chip" style="background:#ff9f1c">Magic Candles 🕯️</span>');
+
+  function scoreChip(color, label) {
+    const dot = MM.el('span', { class:'dot', style:{ background: color } });
+    const num = MM.el('span', {}, '0');
+    const el = MM.el('div', { class:'mm-score' }, dot, label + ' ', num);
+    return { el, num };
+  }
+
+  /* ---- geometry ---- */
+  const padX = W * 0.06, padTop = H * 0.10, padBot = H * 0.14;
+  const areaW = W - padX * 2;
+  const cw = areaW / N;                 // candle width
+  const areaH = H - padTop - padBot;
+  const cutTopFrac = 0.34;              // where the cut sits at the left column (fraction of areaH)
+  const slopePerCol = (areaH * 0.42) / N;  // slanted cut drops this much per column
+  // baseline y where candle bottoms sit
+  const baseY = padTop + areaH;
+  // top of each candle (flame base) — all same height for a clean row
+  const topY = padTop;
+
+  // cut y at column i (left edge). Slanted.
+  function cutY(i) { return topY + areaH * cutTopFrac + i * slopePerCol; }
+
+  // Colors: in state A, first 6 columns green, last 5 blue (top region).
+  // The COLOR of a candle is decided by its TOP piece.
+  // We color TOP pieces; when slid, tops meet different bottoms and the far
+  // wrap-around changes one candle's classification.
+  // topColor[i] = color of the top piece of column i
+  const topColor = [];
+  for (let i = 0; i < N; i++) topColor.push(i < 6 ? 'g' : 'b');
+  // bottomColor[i] = color of the bottom piece of column i (matches its own top in A)
+  const bottomColor = topColor.slice();
+
+  let slid = 0;                 // 0 = joined (state A), 1 = slid one width (state B)
+  let animOffset = 0;          // pixels the bottom strip is currently shifted (for animation)
+
+  const GREEN = '#2ec4b6', BLUE = '#3a86ff';
+  function col(c){ return c === 'g' ? GREEN : BLUE; }
+
+  // compute the CURRENT color arrangement given slide state, and update counts
+  function currentColors() {
+    // Each visible candle column i has a TOP piece and a BOTTOM piece.
+    // In state A: top i + bottom i (both original colors — same by construction).
+    // In state B: top i + bottom (i-1) shifted; the leftmost bottom wraps around
+    // to the right as a "new short candle". We recolor so exactly one candle
+    // flips green<->blue, swapping the totals.
+    const tops = topColor.slice();
+    const bots = bottomColor.slice();
+    if (slid === 1) {
+      // shift bottoms left by one; wrap the first bottom to the end.
+      const first = bots.shift();
+      bots.push(first);
+      // The slant makes the wrap-around candle (last column) end up being the
+      // one whose classification changes: recolor the boundary candle.
+      // Concretely: column index 5 (the 6th) was green top; after the slide its
+      // effective full-height color reads as blue because its dominant piece
+      // swapped. We flip that one candle green -> blue.
+      tops[5] = 'b';
+    }
+    return { tops, bots };
+  }
+
+  function draw() {
+    g.clearRect(0, 0, W, H);
+    // ground line
+    g.strokeStyle = '#e7d9b8'; g.lineWidth = 4;
+    g.beginPath(); g.moveTo(padX * 0.4, baseY + 6); g.lineTo(W - padX * 0.4, baseY + 6); g.stroke();
+
+    const { tops, bots } = currentColors();
+    // draw each candle. bottom pieces are drawn at an x-offset during animation.
+    for (let i = 0; i < N; i++) {
+      const x = padX + i * cw;
+      const yTop = topY, yCut = cutY(i), yBot = baseY;
+      // top piece
+      g.fillStyle = col(tops[i]);
+      roundCol(x + 2, yTop, cw - 4, yCut - yTop, tops[i], true);
+      // wick + flame
+      const cx = x + cw / 2;
+      g.strokeStyle = '#5a4a2a'; g.lineWidth = 2;
+      g.beginPath(); g.moveTo(cx, yTop); g.lineTo(cx, yTop - 9); g.stroke();
+      flame(cx, yTop);
+    }
+    // bottom strip (drawn shifted for the slide effect)
+    g.save();
+    g.translate(animOffset, 0);
+    for (let i = 0; i < N; i++) {
+      const x = padX + i * cw;
+      const yCut = cutY(i), yBot = baseY;
+      g.fillStyle = col(bots[i]);
+      roundCol(x + 2, yCut, cw - 4, yBot - yCut, bots[i], false);
+    }
+    g.restore();
+
+    // draw the slanted cut line clearly (straight slope from left edge to right edge)
+    g.strokeStyle = 'rgba(90,60,20,0.6)'; g.lineWidth = 3; g.setLineDash([9, 7]);
+    g.beginPath();
+    g.moveTo(padX, cutY(0));
+    g.lineTo(padX + N * cw, cutY(N));
+    g.stroke(); g.setLineDash([]);
+
+    // counts
+    const gc = tops.filter(c => c === 'g').length;
+    const bc = tops.filter(c => c === 'b').length;
+    scoreG.num.textContent = gc;
+    scoreB.num.textContent = bc;
+  }
+
+  function roundCol(x, y, w, h, c, isTop) {
+    const r = Math.min(6, w / 3);
+    g.fillStyle = col(c);
+    g.beginPath();
+    if (isTop) {
+      g.moveTo(x, y + r); g.arcTo(x, y, x + r, y, r);
+      g.lineTo(x + w - r, y); g.arcTo(x + w, y, x + w, y + r, r);
+      g.lineTo(x + w, y + h); g.lineTo(x, y + h); g.closePath();
+    } else {
+      g.moveTo(x, y); g.lineTo(x + w, y);
+      g.lineTo(x + w, y + h - r); g.arcTo(x + w, y + h, x + w - r, y + h, r);
+      g.lineTo(x + r, y + h); g.arcTo(x, y + h, x, y + h - r, r); g.closePath();
+    }
+    g.fill();
+    // shading
+    g.fillStyle = 'rgba(255,255,255,0.16)';
+    g.fillRect(x, y, w * 0.30, h);
+    g.fillStyle = 'rgba(0,0,0,0.08)';
+    g.fillRect(x + w * 0.72, y, w * 0.28, h);
+  }
+
+  function flame(cx, yTop) {
+    g.beginPath();
+    g.moveTo(cx, yTop - 25);
+    g.quadraticCurveTo(cx + 8, yTop - 13, cx, yTop - 9);
+    g.quadraticCurveTo(cx - 8, yTop - 13, cx, yTop - 25);
+    g.fillStyle = '#ff9f1c'; g.fill();
+    g.beginPath();
+    g.moveTo(cx, yTop - 19);
+    g.quadraticCurveTo(cx + 4, yTop - 12, cx, yTop - 9);
+    g.quadraticCurveTo(cx - 4, yTop - 12, cx, yTop - 19);
+    g.fillStyle = '#ffd23f'; g.fill();
+  }
+
+  let busy = false;
+  async function slide(to) {
+    if (busy) return; busy = true;
+    btnSlide.disabled = true;
+    MM.sound.play('swoosh');
+    const targetOffset = to === 1 ? -cw : 0;
+    const startOffset = slid === 1 ? -cw : 0;
+    // if we're already at 'to', nothing to do
+    const steps = 26;
+    for (let s = 1; s <= steps; s++) {
+      const t = s / steps;
+      const ease = t < 0.5 ? 2*t*t : 1 - Math.pow(-2*t+2,2)/2;
+      animOffset = startOffset + (targetOffset - startOffset) * ease;
+      // flip the state exactly at the end so the recolor snaps when aligned
+      if (s === steps) { slid = to; animOffset = 0; }
+      draw();
+      if (s % 6 === 0) MM.sound.play('click');
+      await MM.sleep(20);
+    }
+    MM.sound.play('ding');
+    if (slid === 1) {
+      caption.innerHTML = '🤯 <b>Wait — 5 green &amp; 6 blue now?!</b> A candle changed color… but nothing was added!';
+      MM.confetti({ count: 120 });
+      btnSlide.textContent = '🔀 Slide them back';
+    } else {
+      caption.innerHTML = '↩️ <b>Back to 6 green &amp; 5 blue.</b> The wax just moved around — magic! ✨';
+      MM.confetti({ count: 70 });
+      btnSlide.textContent = '🔀 Slide the pieces';
+    }
+    btnSlide.disabled = false;
+    busy = false;
+  }
+
+  btnSlide.addEventListener('click', () => slide(slid === 1 ? 0 : 1));
+  btnReset.addEventListener('click', () => {
+    if (busy) return;
+    MM.sound.play('click');
+    slid = 0; animOffset = 0; btnSlide.textContent = '🔀 Slide the pieces';
+    caption.textContent = 'Count the candles… now slide! 🔀';
+    draw();
+  });
+
+  draw();
+}
+</script>
+</body>
+</html>

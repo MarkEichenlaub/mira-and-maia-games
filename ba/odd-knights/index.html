@@ -1,0 +1,303 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Odd Knights</title>
+<link rel="stylesheet" href="../../assets/common.css">
+</head>
+<body>
+<script src="../../assets/common.js"></script>
+<script>
+/* ODD KNIGHTS — an ODD number of knights sit in a circle. On your turn take
+   ONE knight, or TWO knights that are currently ADJACENT (no remaining knight
+   between them). Play until all are taken. You WIN if you hold an ODD count.
+   Since the total is odd, exactly one player is odd.
+
+   AI: perfect negamax with memoization over (remaining set of circle slots,
+   parity of the side-to-move's collected count). The winner depends only on
+   parities, so we track mover parity and evaluate whether the mover can end odd. */
+
+MM.game({
+  title: 'Odd Knights', emoji: '♟️',
+  ba: 'https://beastacademy.com/playground/odd-knights',
+  rules: `
+    <p><b>Collect an ODD number of knights!</b> The knights ♟️ sit in a circle.</p>
+    <ol>
+      <li>On your turn, tap <b>one</b> knight to take it…</li>
+      <li>…or tap <b>two knights that touch</b> (next to each other in the circle) to take both.</li>
+      <li>Keep going until all knights are gone.</li>
+      <li>You <b>win</b> if you end up holding an <b>odd</b> number of knights! 🏆</li>
+    </ol>
+    <p>The total is always odd, so exactly one player wins — no ties!</p>`,
+  modes: [
+    { id: 'ai',  emoji: '🤖', name: 'Vs Computer', sub: 'You go first' },
+    { id: 'two', emoji: '🧑‍🤝‍🧑', name: '2 Players', sub: 'Pass & play' },
+  ],
+  onStart,
+});
+
+const HEX = { 1: '#3a86ff', 2: '#ff5a5f' };
+
+function onStart(mode, mount) {
+  const vsAI = (mode === 'ai');
+  const AI = 2;               // computer is player 2; human moves first
+  let start = MM.load('oddk-start', 9);
+
+  let mask = 0;              // bitmask of knights still on the board (bit i set = present)
+  let n = start;            // circle size
+  let collected = { 1: 0, 2: 0 };
+  let turn = 1;
+  let sel = -1;             // first-selected knight index (for taking 2)
+  let over = false;
+  let busy = false;
+
+  // ---- layout ----
+  const panel = MM.el('div', { class: 'mm-panel mm-center mm-bounce-in' });
+
+  const pillRow = MM.el('div', { class: 'mm-pills', style: { marginBottom: '10px' } });
+  function buildPills() {
+    pillRow.innerHTML = '';
+    pillRow.appendChild(MM.el('span', { style: { fontWeight: '800', alignSelf: 'center', marginRight: '4px' } }, 'Knights:'));
+    [7, 9, 11].forEach(v => {
+      pillRow.appendChild(MM.el('button', {
+        class: 'mm-pill', 'aria-pressed': String(v === start),
+        onClick: () => { if (busy) return; MM.sound.play('click'); start = v; MM.store('oddk-start', v); reset(); },
+      }, '♟️ ' + v));
+    });
+  }
+
+  const size = Math.min(400, window.innerWidth - 40);
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('viewBox', `0 0 ${size} ${size}`);
+  svg.style.width = size + 'px'; svg.style.maxWidth = '100%'; svg.style.height = 'auto';
+  svg.style.touchAction = 'manipulation';
+
+  // scoreboard
+  const scoreBar = MM.el('div', { class: 'mm-scorebar' });
+  const hint = MM.el('div', { class: 'mm-hint' });
+
+  panel.append(pillRow, scoreBar, svg, hint);
+  mount.appendChild(panel);
+
+  // knight positions on the circle
+  function positions() {
+    const R = size / 2 - 46, cx = size / 2, cy = size / 2;
+    const P = [];
+    for (let i = 0; i < n; i++) {
+      const ang = -Math.PI / 2 + i * 2 * Math.PI / n;
+      P.push([cx + R * Math.cos(ang), cy + R * Math.sin(ang)]);
+    }
+    return P;
+  }
+
+  // present knights, in circle order
+  function present() { const a = []; for (let i = 0; i < n; i++) if (mask & (1 << i)) a.push(i); return a; }
+
+  // are indices a and b adjacent among currently-present knights?
+  function adjacentPresent(a, b) {
+    const pr = present();
+    const ia = pr.indexOf(a), ib = pr.indexOf(b);
+    if (ia < 0 || ib < 0 || pr.length < 2) return false;
+    const d = Math.abs(ia - ib);
+    return d === 1 || d === pr.length - 1;   // neighbors in the circular order
+  }
+
+  function label(pl) {
+    if (!vsAI) return 'Player ' + pl;
+    return pl === AI ? 'Computer' : 'You';
+  }
+
+  function renderScores() {
+    scoreBar.innerHTML = '';
+    [1, 2].forEach(pl => {
+      const c = collected[pl];
+      scoreBar.appendChild(MM.el('div', { class: 'mm-score' + (turn === pl && !over ? ' active' : '') },
+        MM.el('span', { class: 'dot', style: { background: HEX[pl] } }),
+        MM.el('span', {}, label(pl)),
+        MM.el('span', { style: { fontWeight: '900', fontSize: '22px' } }, String(c)),
+        MM.el('span', { style: { fontSize: '14px', color: c % 2 === 1 ? 'var(--c-green)' : 'var(--ink-soft)' } },
+          c === 0 ? '' : (c % 2 === 1 ? '(odd ✓)' : '(even)')),
+      ));
+    });
+  }
+
+  function render() {
+    svg.innerHTML = '';
+    const P = positions();
+    // faint ring connecting present knights
+    const pr = present();
+    if (pr.length >= 2) {
+      for (let k = 0; k < pr.length; k++) {
+        const a = P[pr[k]], b = P[pr[(k + 1) % pr.length]];
+        const l = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+        l.setAttribute('x1', a[0]); l.setAttribute('y1', a[1]);
+        l.setAttribute('x2', b[0]); l.setAttribute('y2', b[1]);
+        l.setAttribute('stroke', '#efe7d8'); l.setAttribute('stroke-width', 6); l.setAttribute('stroke-linecap', 'round');
+        svg.appendChild(l);
+      }
+    }
+    for (let i = 0; i < n; i++) {
+      if (!(mask & (1 << i))) continue;
+      const [x, y] = P[i];
+      const g = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+      g.style.cursor = 'pointer';
+      const isSel = sel === i;
+      const c = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+      c.setAttribute('cx', x); c.setAttribute('cy', y); c.setAttribute('r', 28);
+      c.setAttribute('fill', isSel ? '#ffd23f' : '#fff');
+      c.setAttribute('stroke', isSel ? '#ff9f1c' : '#22223b'); c.setAttribute('stroke-width', 4);
+      const t = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+      t.setAttribute('x', x); t.setAttribute('y', y + 1);
+      t.setAttribute('text-anchor', 'middle'); t.setAttribute('dominant-baseline', 'central');
+      t.setAttribute('font-size', '30'); t.textContent = '♞';
+      t.style.pointerEvents = 'none';
+      g.appendChild(c); g.appendChild(t);
+      g.addEventListener('click', () => knightClick(i));
+      svg.appendChild(g);
+    }
+    renderScores();
+    statusUpdate();
+  }
+
+  function statusUpdate() {
+    if (over) return;
+    const who = vsAI ? (turn === AI ? 'Computer…' : 'Your turn') : ('Player ' + turn + "'s turn");
+    MM.status(`<span class="chip" style="background:${HEX[turn]}">${who}</span>`);
+    if (vsAI && turn === AI) hint.textContent = 'The computer is choosing…';
+    else if (sel >= 0) hint.textContent = 'Tap the same knight again to take 1, or a neighbor to take 2.';
+    else hint.textContent = 'Tap 1 knight, or 2 that touch, to take them.';
+  }
+
+  function knightClick(i) {
+    if (over || busy) return;
+    if (vsAI && turn === AI) return;
+    if (!(mask & (1 << i))) return;
+    MM.sound.play('click');
+    if (sel < 0) { sel = i; render(); return; }
+    if (sel === i) { doTake([i], turn); return; }      // second tap on same → take 1
+    if (adjacentPresent(sel, i)) { doTake([sel, i], turn); return; }
+    // not adjacent → reselect
+    sel = i; render();
+  }
+
+  async function doTake(idxs, pl) {
+    busy = true; sel = -1;
+    for (const i of idxs) mask &= ~(1 << i);
+    collected[pl] += idxs.length;
+    MM.sound.play(idxs.length === 2 ? 'swoosh' : 'pop');
+    render();
+    await MM.sleep(150);
+    if (mask === 0) { finish(); return; }
+    turn = turn === 1 ? 2 : 1;
+    render();
+    if (vsAI && turn === AI && !over) { setTimeout(aiTurn, 600); }
+    else busy = false;
+  }
+
+  // ---- Perfect AI: minimax over (mask, my collected parity, whose turn) ----
+  // enumerate legal moves from a given mask: arrays of present indices to remove.
+  function movesFor(m) {
+    const pr = []; for (let i = 0; i < n; i++) if (m & (1 << i)) pr.push(i);
+    const list = [];
+    for (const i of pr) list.push([i]);                 // take one
+    if (pr.length >= 2) {
+      for (let k = 0; k < pr.length; k++) {
+        const a = pr[k], b = pr[(k + 1) % pr.length];
+        if (a === b) continue;
+        // avoid duplicate pair when only 2 remain (wrap == forward)
+        if (pr.length === 2 && k === 1) continue;
+        list.push([a, b]);
+      }
+    }
+    return list;
+  }
+
+  // Model: exactly one player ends odd (total is odd), so "I end odd" == "opponent
+  // ends even". We optimize one side of interest, tracking its collected parity
+  // (myPar) and whose turn it is. value() = true iff the side of interest can force
+  // itself to finish with an ODD total, against best opposing play.
+  const memo2 = new Map();
+  function value(m, myPar, myTurn) {
+    // true iff the side of interest (collected parity myPar) can force ending ODD.
+    if (m === 0) return myPar === 1;                    // board empty: my parity decides
+    const key = (m * 4) + (myPar * 2) + (myTurn ? 1 : 0);
+    const c = memo2.get(key);
+    if (c !== undefined) return c;
+    let res = !myTurn;                 // my turn: need one true (OR); opp turn: need all true (AND)
+    for (const mv of movesFor(m)) {
+      let nm = m; for (const i of mv) nm &= ~(1 << i);
+      // Only the side of interest's own takes change its parity.
+      const r = myTurn
+        ? value(nm, (myPar + mv.length) & 1, false)
+        : value(nm, myPar, true);
+      if (myTurn) { if (r) { res = true; break; } }     // OR over my moves
+      else { if (!r) { res = false; break; } }          // AND over opponent moves
+    }
+    memo2.set(key, res);
+    return res;
+  }
+
+  // choose the AI's best move using value(): AI wants its own collected to end odd.
+  function bestAIMove() {
+    memo2.clear();
+    const aiPar = collected[AI] & 1;
+    const moves = MM.shuffle(movesFor(mask));
+    let winning = null;
+    const fallback = moves[0];
+    for (const mv of moves) {
+      let nm = mask; for (const i of mv) nm &= ~(1 << i);
+      // after AI moves, it's opponent's turn (myTurn=false from AI's perspective).
+      const aiEndsOdd = value(nm, (aiPar + mv.length) & 1, false);
+      if (aiEndsOdd) { winning = mv; break; }
+    }
+    return winning || fallback;
+  }
+
+  async function aiTurn() {
+    if (over) return;
+    const mv = bestAIMove();
+    // visually select then take for clarity
+    if (mv.length === 2) { sel = mv[0]; render(); await MM.sleep(300); }
+    await doTake(mv, AI);
+  }
+
+  function finish() {
+    over = true;
+    busy = false;
+    render();
+    let winner = collected[1] % 2 === 1 ? 1 : 2;
+    if (vsAI) {
+      const youWin = winner !== AI;
+      MM.win({
+        lose: !youWin,
+        title: youWin ? 'You have an odd number! 🎉' : 'Computer wins!',
+        emoji: youWin ? '🏆' : '🤖',
+        sub: 'You: ' + collected[AI === 1 ? 2 : 1] + '  ·  Computer: ' + collected[AI] +
+             (youWin ? '' : ' — try taking pairs to flip your parity!'),
+        onAgain: () => MM.toMenu(),
+      });
+    } else {
+      MM.win({
+        title: label(winner) + ' wins! 🎉',
+        emoji: winner === 1 ? '🔵' : '🔴',
+        sub: 'Player 1: ' + collected[1] + '  ·  Player 2: ' + collected[2] + ' — odd wins!',
+        onAgain: () => MM.toMenu(),
+      });
+    }
+  }
+
+  function reset() {
+    over = false; busy = false; sel = -1; turn = 1;
+    n = start; mask = (1 << n) - 1; collected = { 1: 0, 2: 0 };
+    memo.clear(); memo2.clear();
+    buildPills();
+    render();
+    // human moves first in vsAI
+  }
+
+  reset();
+}
+</script>
+</body>
+</html>

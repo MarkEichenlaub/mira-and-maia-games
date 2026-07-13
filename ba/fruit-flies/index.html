@@ -1,0 +1,479 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Fruit Flies</title>
+<link rel="stylesheet" href="../../assets/common.css">
+</head>
+<body>
+<script src="../../assets/common.js"></script>
+<script>
+/* FRUIT FLIES — a "geography / trail" game on a bunch of grapes.
+   A bunch = a cluster of touching grape circles; two grapes are connected if they
+   touch. Player 1 places their fly on any grape; Player 2 places on a different grape.
+   Player 2 moves first, then alternate. On your turn you must:
+     (1) EAT the grape your fly sits on (it can never be entered again), then
+     (2) MOVE your fly to an ADJACENT uneaten grape.
+   If you can't move (no uneaten neighbour), you LOSE.
+
+   AI: negamax with memoization over (whose-turn, my-pos, opp-pos, eaten-set as bitmask).
+   ~14 grapes → 2^14 states × positions, well within a node budget. If the budget is
+   exceeded we fall back to a mobility/opposition heuristic. Easy plays noisily. */
+
+const PURPLE = '#8338ec', GREEN = '#2ec4b6';
+const HEX = { 1: '#3a86ff', 2: '#ff5a5f' };   // fly colors (p1 blue, p2 red/computer)
+
+MM.game({
+  title: 'Fruit Flies', emoji: '🍇',
+  ba: 'https://beastacademy.com/playground/fruit-flies',
+  rules: `
+    <p><b>Two hungry flies on a bunch of grapes!</b> 🪰🍇 Grapes that touch are
+    connected. Each fly hops between touching grapes.</p>
+    <ol>
+      <li>First, each player taps a grape to land their fly (on different grapes).</li>
+      <li>On your turn you <b>EAT</b> the grape you're on (it turns dark and is gone
+          forever), then <b>hop</b> to a touching grape that hasn't been eaten.</li>
+      <li>If you <b>can't hop</b> anywhere — you're stuck and you <b>LOSE</b>! 😮</li>
+    </ol>
+    <p><b>Tip:</b> lead your opponent into a dead end while keeping your own escape open!</p>`,
+  modes: [
+    { id: 'ai',  emoji: '🤖', name: 'Vs Computer', sub: 'You are blue' },
+    { id: 'two', emoji: '🧑‍🤝‍🧑', name: '2 Players', sub: 'Pass & play' },
+  ],
+  onStart,
+});
+
+function onStart(mode, mount) {
+  const vsAI = mode === 'ai';
+  const AI = 2;                        // computer is player 2 (and moves first after placement)
+  let hard = MM.load('ff-hard', true);
+
+  // ----- build a grape bunch: a cluster of circles in a pleasing triangular bunch -----
+  // grapes: {x,y,r} in svg units. adjacency by distance.
+  let grapes, adj, N;
+  function buildBunch() {
+    // A tapered bunch: wider at top, narrowing to a point at bottom. ~14 grapes.
+    // rows of counts:
+    const rows = [3, 3, 3, 2, 1];     // total 12; add a couple offset ones for character
+    const gr = [];
+    const spacingX = 46, spacingY = 42, r = 25;
+    let y = 0;
+    for (let ri = 0; ri < rows.length; ri++) {
+      const cnt = rows[ri];
+      const rowW = (cnt - 1) * spacingX;
+      // slight horizontal jitter per row for an organic bunch
+      const offset = (ri % 2) * (spacingX / 2);
+      for (let i = 0; i < cnt; i++) {
+        const x = -rowW / 2 + i * spacingX + offset;
+        gr.push({ x, y: y, r });
+      }
+      y += spacingY;
+    }
+    // add two side grapes near the top for a fuller bunch (total 14)
+    gr.push({ x: -(2 * spacingX), y: spacingY * 0.5, r });
+    gr.push({ x: (2 * spacingX) - spacingX + (spacingX / 2), y: spacingY * 1.5, r });
+    // normalize into positive coordinates with padding
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const g of gr) { minX = Math.min(minX, g.x - g.r); minY = Math.min(minY, g.y - g.r); maxX = Math.max(maxX, g.x + g.r); maxY = Math.max(maxY, g.y + g.r); }
+    const pad = 14;
+    for (const g of gr) { g.x = g.x - minX + pad; g.y = g.y - minY + pad; }
+    grapes = gr;
+    N = gr.length;
+    // adjacency: connected if circles touch/overlap (distance < r1+r2+slack)
+    adj = Array.from({ length: N }, () => []);
+    for (let a = 0; a < N; a++) for (let b = a + 1; b < N; b++) {
+      const dx = gr[a].x - gr[b].x, dy = gr[a].y - gr[b].y;
+      const d = Math.hypot(dx, dy);
+      if (d < gr[a].r + gr[b].r + 12) { adj[a].push(b); adj[b].push(a); }
+    }
+    return { w: maxX - minX + pad * 2, h: maxY - minY + pad * 2 };
+  }
+
+  // color each grape green or purple for visual variety (deterministic-ish)
+  let grapeColor;
+  function colorGrapes() {
+    grapeColor = grapes.map((g, i) => ((i * 7 + Math.floor(g.y)) % 5 === 0) ? GREEN : PURPLE);
+  }
+
+  const bbox = buildBunch();
+  colorGrapes();
+
+  // ----- game state -----
+  // eaten = bitmask; pos[1], pos[2] = grape index or -1 (not placed); phase 'place'|'play'
+  let eaten, pos, turn, phase, over, busy, placedCount;
+
+  const panel = MM.el('div', { class: 'mm-panel mm-center mm-bounce-in' });
+  const pillRow = MM.el('div', { class: 'mm-pills', style: { marginBottom: '10px' } });
+  const scorebar = MM.el('div', { class: 'mm-scorebar' });
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.style.maxWidth = '100%'; svg.style.height = 'auto'; svg.style.touchAction = 'manipulation';
+  const hint = MM.el('div', { class: 'mm-hint' });
+  panel.append(pillRow, scorebar, svg, hint);
+  mount.appendChild(panel);
+
+  // scale svg to viewport
+  let scale;
+  function layout() {
+    const wpx = Math.min(400, window.innerWidth - 40);
+    scale = wpx / bbox.w;
+    svg.setAttribute('viewBox', `0 0 ${bbox.w} ${bbox.h}`);
+    svg.style.width = wpx + 'px';
+  }
+
+  function buildPills() {
+    pillRow.innerHTML = '';
+    if (!vsAI) return;
+    pillRow.appendChild(MM.el('span', { class: 'ff-pill-label' }, 'Robot:'));
+    [['Easy', false, '🐣'], ['Smart', true, '🧠']].forEach(([name, val, em]) => {
+      pillRow.appendChild(MM.el('button', {
+        class: 'mm-pill', 'aria-pressed': String(val === hard),
+        onClick: () => { if (busy) return; MM.sound.play('click'); hard = val; MM.store('ff-hard', val); buildPills(); },
+      }, em + ' ' + name));
+    });
+  }
+
+  function isEaten(i) { return (eaten & (1 << i)) !== 0; }
+
+  // legal grapes the CURRENT mover can move to (adjacent, uneaten, not occupied by the other fly)
+  function legalFrom(p, other) {
+    const out = [];
+    for (const n of adj[p]) if (!isEaten(n) && n !== other) out.push(n);
+    return out;
+  }
+  function curMoves() {
+    if (phase !== 'play') return [];
+    return legalFrom(pos[turn], pos[turn === 1 ? 2 : 1]);
+  }
+
+  function humanTurn() {
+    if (over) return false;
+    if (!vsAI) return true;
+    return turn !== AI;
+  }
+
+  /* ---------- render ---------- */
+  function render() {
+    layout();
+    svg.innerHTML = '';
+    const can = humanTurn();
+    // in placement phase, legal = any uneaten grape not occupied
+    let targets = new Set();
+    if (phase === 'place' && can) {
+      for (let i = 0; i < N; i++) if (i !== pos[1] && i !== pos[2]) targets.add(i);
+    } else if (phase === 'play' && can) {
+      for (const n of curMoves()) targets.add(n);
+    }
+
+    // draw stems/connections faintly (only between uneaten grapes)
+    for (let a = 0; a < N; a++) for (const b of adj[a]) if (a < b) {
+      const alive = !isEaten(a) && !isEaten(b);
+      const l = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+      l.setAttribute('x1', grapes[a].x); l.setAttribute('y1', grapes[a].y);
+      l.setAttribute('x2', grapes[b].x); l.setAttribute('y2', grapes[b].y);
+      l.setAttribute('stroke', alive ? '#c9b8a0' : '#e8e2d6');
+      l.setAttribute('stroke-width', alive ? 4 : 2); l.setAttribute('stroke-linecap', 'round');
+      l.setAttribute('stroke-opacity', alive ? 0.6 : 0.25);
+      svg.appendChild(l);
+    }
+
+    // draw grapes
+    for (let i = 0; i < N; i++) {
+      const g = grapes[i];
+      const c = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+      c.setAttribute('cx', g.x); c.setAttribute('cy', g.y); c.setAttribute('r', g.r);
+      const isT = targets.has(i);
+      if (isEaten(i)) {
+        c.setAttribute('fill', '#3a3350'); c.setAttribute('stroke', '#2a2440'); c.setAttribute('stroke-width', 2);
+        c.setAttribute('fill-opacity', '0.55');
+      } else {
+        c.setAttribute('fill', grapeColor[i]);
+        c.setAttribute('stroke', isT ? '#ffd23f' : '#ffffffcc');
+        c.setAttribute('stroke-width', isT ? 5 : 3);
+        if (isT) c.classList.add('ff-target');
+      }
+      if (isT) { c.style.cursor = 'pointer'; c.addEventListener('click', () => tapGrape(i)); }
+      svg.appendChild(c);
+      // shine highlight
+      if (!isEaten(i)) {
+        const sh = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+        sh.setAttribute('cx', g.x - g.r * 0.32); sh.setAttribute('cy', g.y - g.r * 0.32);
+        sh.setAttribute('r', g.r * 0.22); sh.setAttribute('fill', '#ffffff'); sh.setAttribute('fill-opacity', '0.5');
+        sh.style.pointerEvents = 'none';
+        svg.appendChild(sh);
+      }
+    }
+    // draw flies on top
+    [1, 2].forEach(pl => {
+      if (pos[pl] < 0) return;
+      const g = grapes[pos[pl]];
+      const t = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+      t.setAttribute('x', g.x); t.setAttribute('y', g.y); t.setAttribute('text-anchor', 'middle');
+      t.setAttribute('dominant-baseline', 'central'); t.setAttribute('font-size', g.r * 1.35);
+      t.style.pointerEvents = 'none';
+      t.textContent = '🪰';
+      svg.appendChild(t);
+      // colored ring to tell the flies apart
+      const ring = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+      ring.setAttribute('cx', g.x); ring.setAttribute('cy', g.y); ring.setAttribute('r', g.r + 3);
+      ring.setAttribute('fill', 'none'); ring.setAttribute('stroke', HEX[pl]); ring.setAttribute('stroke-width', 4);
+      ring.style.pointerEvents = 'none';
+      if (turn === pl && !over) ring.classList.add('ff-active-ring');
+      svg.appendChild(ring);
+    });
+
+    renderScore();
+    statusUpdate();
+  }
+
+  function renderScore() {
+    scorebar.innerHTML = '';
+    [1, 2].forEach(pl => {
+      const name = vsAI ? (pl === AI ? '🤖 Computer' : '🧒 You') : ('Player ' + pl);
+      scorebar.appendChild(MM.el('div', { class: 'mm-score' + (turn === pl && !over ? ' active' : '') },
+        MM.el('span', { class: 'dot', style: { background: HEX[pl] } }), name));
+    });
+  }
+
+  function statusUpdate() {
+    if (over) { hint.textContent = ''; return; }
+    let who;
+    if (vsAI) who = turn === AI ? '🤖 Computer…' : '🧒 Your turn';
+    else who = 'Player ' + turn;
+    MM.status(`<span class="chip" style="background:${HEX[turn]}">${who}</span>`);
+    if (vsAI && turn === AI) { hint.textContent = 'The computer is buzzing…'; return; }
+    if (phase === 'place') hint.textContent = (pos[1] < 0 && pos[2] < 0)
+      ? 'Tap a grape to land your fly.'
+      : 'Tap a different grape to land your fly.';
+    else hint.textContent = 'Tap a glowing grape to eat this one and hop over.';
+  }
+
+  /* ---------- interaction ---------- */
+  function tapGrape(i) {
+    if (over || busy || !humanTurn()) return;
+    if (phase === 'place') {
+      if (i === pos[1] || i === pos[2]) { MM.sound.play('wrong'); return; }
+      place(i);
+    } else {
+      if (!curMoves().includes(i)) { MM.sound.play('wrong'); return; }
+      hop(i);
+    }
+  }
+
+  // placement order: Player 1 places, then Player 2 places, then Player 2 moves first.
+  function place(i) {
+    pos[turn] = i;
+    MM.sound.play('place');
+    placedCount++;
+    if (placedCount === 1) {
+      // player 1 placed -> now player 2 places
+      turn = 2;
+      render(); maybeAI(); return;
+    }
+    // both placed -> play begins, Player 2 moves first (turn already 2)
+    phase = 'play';
+    turn = 2;
+    render();
+    // check P2 actually has a move
+    if (curMoves().length === 0) { finish(1); return; }
+    maybeAI();
+  }
+
+  function hop(to) {
+    const from = pos[turn];
+    eaten |= (1 << from);          // eat the grape we're leaving
+    pos[turn] = to;
+    MM.sound.play('pop');
+    // next player
+    turn = turn === 1 ? 2 : 1;
+    render();
+    // does the next player have a move?
+    if (curMoves().length === 0) { finish(turn === 1 ? 2 : 1); return; }
+    maybeAI();
+  }
+
+  function maybeAI() {
+    if (over) return;
+    if (vsAI && turn === AI) { busy = true; statusUpdate(); setTimeout(aiTurn, 480); }
+  }
+
+  /* ---------- AI ----------
+     PLACEMENT: pick a strong opening. As player 2 (moves first), a good idea is to
+     land adjacent to nothing bad and with high mobility; if the human already placed,
+     use negamax to choose the placement that leads to a won game if one exists.
+     PLAY: negamax with memoization; fall back to mobility heuristic under budget. */
+
+  let nodes = 0, budget = 120000;
+  const memo = new Map();
+  // negamax from perspective of `me` (the player to move). Returns +1 if `me` wins, -1 if loses.
+  // state: me, opp positions + eaten mask. `me` must eat current grape then move.
+  function nega(meP, oppP, mask, depth) {
+    if (nodes++ > budget) return 0;      // unknown -> treat as neutral (heuristic will decide up top)
+    const key = meP + ',' + oppP + ',' + mask;
+    const hit = memo.get(key);
+    if (hit !== undefined) return hit;
+    // me eats meP (add to mask), then must move to a neighbour not eaten, not oppP
+    const nmask = mask | (1 << meP);
+    let anyMove = false, val = -1;
+    for (const n of adj[meP]) {
+      if ((nmask & (1 << n)) || n === oppP) continue;
+      anyMove = true;
+      const r = -nega(oppP, n, nmask, depth + 1);
+      if (r > val) val = r;
+      if (val === 1) break;              // winning move found
+    }
+    if (!anyMove) val = -1;              // me can't move -> me loses
+    memo.set(key, val);
+    return val;
+  }
+
+  // mobility heuristic (used for Easy and as budget fallback): my reachable room vs opp's.
+  function roomFrom(start, mask, blocked) {
+    // BFS of uneaten grapes reachable from start (excluding blocked and eaten)
+    const seen = new Set(); const q = [start]; seen.add(start); let count = 0;
+    while (q.length) { const x = q.shift(); count++; for (const n of adj[x]) { if (n === blocked) continue; if (mask & (1 << n)) continue; if (seen.has(n)) continue; seen.add(n); q.push(n); } }
+    return count;
+  }
+  function heurMove(meP, oppP) {
+    const moves = legalFrom(meP, oppP);
+    if (moves.length === 0) return null;
+    const nmask = eaten | (1 << meP);
+    let best = null, bestScore = -Infinity;
+    for (const m of MM.shuffle(moves.slice())) {
+      // after I move to m and eat meP: my future room vs opp future room
+      const myRoom = roomFrom(m, nmask, oppP);
+      const oppRoom = roomFrom(oppP, nmask, m);
+      // prefer keeping my room big and shrinking opponent's; also value my move-count next
+      const myNext = legalFrom(m, oppP).filter(x => !(nmask & (1 << x))).length;
+      const score = myRoom * 1.0 - oppRoom * 1.0 + myNext * 0.5 + (Math.random() * 0.2);
+      if (score > bestScore) { bestScore = score; best = m; }
+    }
+    return best;
+  }
+
+  function aiPlace() {
+    // choose placement to maximise outcome. If opponent hasn't placed yet (AI is p1) —
+    // but in this game AI is p2 and always places second, so the human (p1) has placed.
+    const taken = new Set([pos[1], pos[2]].filter(x => x >= 0));
+    const cands = [];
+    for (let i = 0; i < N; i++) if (!taken.has(i)) cands.push(i);
+    if (hard) {
+      // For each candidate AI landing spot, AI (p2) moves first: value = nega for AI to move.
+      memo.clear(); nodes = 0;
+      let best = null, bestVal = -2, bestRoom = -1;
+      for (const i of MM.shuffle(cands)) {
+        const v = nega(i, pos[1], eaten, 0);      // AI to move from i, opponent at pos[1]
+        const room = roomFrom(i, eaten | (1 << i), pos[1]);
+        if (v > bestVal || (v === bestVal && room > bestRoom)) { bestVal = v; best = i; bestRoom = room; }
+        if (nodes > budget) break;
+      }
+      if (best !== null) { place(best); return; }
+    }
+    // Easy / fallback: pick a high-mobility grape, not adjacent to the human (harder to trap early).
+    let best = null, bestScore = -Infinity;
+    for (const i of MM.shuffle(cands)) {
+      let s = adj[i].filter(n => !taken.has(n)).length;   // degree
+      if (adj[i].includes(pos[1])) s -= 1.5;              // avoid landing right next to prey/predator
+      s += Math.random() * 0.5;
+      if (s > bestScore) { bestScore = s; best = i; }
+    }
+    place(best);
+  }
+
+  function aiHop() {
+    const meP = pos[AI], oppP = pos[AI === 1 ? 2 : 1];
+    const moves = legalFrom(meP, oppP);
+    if (moves.length === 0) { finish(AI === 1 ? 2 : 1); return; }
+    if (moves.length === 1) { hop(moves[0]); return; }
+
+    if (hard) {
+      memo.clear(); nodes = 0;
+      // evaluate each move via negamax; pick a winning one, else the best heuristic among losing/unknown.
+      let winning = [], neutral = [], losing = [];
+      const nmask = eaten | (1 << meP);
+      for (const m of moves) {
+        const r = -nega(oppP, m, nmask, 0);   // after I move to m, opp to move
+        if (r === 1) winning.push(m);
+        else if (r === 0) neutral.push(m);
+        else losing.push(m);
+      }
+      if (winning.length) { hop(pickByRoom(winning, meP, oppP)); return; }
+      // no proven win: if search was truncated (neutral) OR all losing, use heuristic among the pool.
+      const pool = neutral.length ? neutral : losing;
+      hop(heurAmong(pool, meP, oppP)); return;
+    }
+    // Easy: heuristic with noise, plus occasional blunder
+    if (Math.random() < 0.25) { hop(MM.choice(moves)); return; }
+    const h = heurMove(meP, oppP);
+    hop(h != null ? h : MM.choice(moves));
+  }
+  function pickByRoom(pool, meP, oppP) {
+    const nmask = eaten | (1 << meP);
+    let best = pool[0], bestScore = -Infinity;
+    for (const m of pool) {
+      const myRoom = roomFrom(m, nmask, oppP);
+      const oppRoom = roomFrom(oppP, nmask, m);
+      const s = myRoom - oppRoom + Math.random() * 0.1;
+      if (s > bestScore) { bestScore = s; best = m; }
+    }
+    return best;
+  }
+  function heurAmong(pool, meP, oppP) {
+    const nmask = eaten | (1 << meP);
+    let best = pool[0], bestScore = -Infinity;
+    for (const m of pool) {
+      const myRoom = roomFrom(m, nmask, oppP);
+      const oppRoom = roomFrom(oppP, nmask, m);
+      const myNext = legalFrom(m, oppP).filter(x => !(nmask & (1 << x))).length;
+      const s = myRoom - oppRoom + myNext * 0.5 + Math.random() * 0.15;
+      if (s > bestScore) { bestScore = s; best = m; }
+    }
+    return best;
+  }
+
+  function aiTurn() {
+    if (over) return;
+    busy = false;
+    if (phase === 'place') aiPlace();
+    else aiHop();
+  }
+
+  /* ---------- end ---------- */
+  function finish(winner) {
+    over = true; busy = false;
+    render();
+    const loser = winner === 1 ? 2 : 1;
+    if (vsAI) {
+      const youWin = winner !== AI;
+      MM.win({ lose: !youWin,
+        title: youWin ? 'You win! 🎉' : 'Computer wins!',
+        emoji: youWin ? '🍇' : '🤖',
+        sub: youWin ? 'The computer fly got stuck!' : 'Your fly ran out of grapes!',
+        onAgain: () => MM.toMenu() });
+    } else {
+      MM.win({ title: 'Player ' + winner + ' wins! 🎉', emoji: winner === 1 ? '🔵' : '🔴',
+        sub: 'Player ' + loser + "'s fly got stuck!", onAgain: () => MM.toMenu() });
+    }
+  }
+
+  /* ---------- reset ---------- */
+  function reset() {
+    eaten = 0; pos = { 1: -1, 2: -1 }; turn = 1; phase = 'place'; over = false; busy = false; placedCount = 0;
+    memo.clear();
+    render();
+    // Player 1 places first; in AI mode the human is P1, so no AI move yet.
+  }
+
+  buildPills();
+  reset();
+}
+</script>
+<style>
+  .ff-pill-label { font-weight: 800; align-self: center; }
+  .ff-target { animation: ffpulse 1.2s ease-in-out infinite; }
+  @keyframes ffpulse { 0%,100% { stroke-opacity: 1; } 50% { stroke-opacity: .4; } }
+  .ff-active-ring { animation: ffring 1s ease-in-out infinite; }
+  @keyframes ffring { 0%,100% { stroke-opacity: 1; } 50% { stroke-opacity: .35; } }
+</style>
+</body>
+</html>
