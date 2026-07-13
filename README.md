@@ -41,9 +41,16 @@ p5.js projective-plane matching puzzles: Order 3, Order 5, and the Fano Plane.
 - `ba/<slug>/index.html`, `mine/<slug>/index.html`, `spot-it/<slug>/` — the games.
 - `assets/vendor/` — local copies of React/Tailwind/d3/etc. so the imported games work offline.
 
-Everything is plain HTML/CSS/JS. To run locally, just open `index.html` in a browser, or serve the
-folder with any static server (recommended, so imported games that `fetch` local data work):
-`python -m http.server`.
+Everything is plain HTML/CSS/JS.
+
+### ▶️ Play locally (offline)
+- **Easiest:** double-click **`launch-arcade.cmd`** (or press **`CapsLock + A`** — wired up in
+  `autohotkey-scripts/default.ahk`). It starts a tiny local web server on port 8777 and opens the
+  arcade in your browser. Run it again any time — it reuses the server if it's already running.
+- **By hand:** from this folder run `python -m http.server 8777` and open `http://localhost:8777/`.
+- **Simplest of all:** just open `index.html` directly. Every game works from `file://` **except** a
+  couple of imported ones that load data files (Cartographer's maps, Photo Memory's geocoding) — those
+  need the local server above.
 
 ## Credits
 The Beast Academy games are fan-made playable versions of activities from **Beast Academy Playground**

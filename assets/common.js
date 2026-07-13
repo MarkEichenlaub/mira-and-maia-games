@@ -205,7 +205,8 @@
       const s = 60 + MM.rand(90);
       document.body.appendChild(MM.el('div', { class: 'mm-blob', style: {
         width: s + 'px', height: s + 'px', background: cols[i % cols.length],
-        left: (5 + MM.rand(90)) + 'vw', top: (10 + MM.rand(80)) + 'vh',
+        // keep blobs away from the right/bottom edges so they never add scroll
+        left: (4 + MM.rand(74)) + 'vw', top: (8 + MM.rand(66)) + 'vh',
         animationDelay: (i * 1.3) + 's'
       } }));
     }
